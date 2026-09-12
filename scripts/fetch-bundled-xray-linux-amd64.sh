@@ -14,8 +14,8 @@ mkdir -p "$OUT_DIR"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-if [[ -f "$OUT_DIR/xray" ]]; then
-  echo "xray already present, skipping download."
+if [[ -f "$OUT_DIR/xray" && "$(cat "$OUT_DIR/xray-version.txt" 2>/dev/null)" == "v${VER}" ]]; then
+  echo "xray v${VER} already staged, skipping download."
 else
   echo "Downloading $URL …"
   curl -fL --retry 3 -o "$TMP/$ASSET" "$URL"

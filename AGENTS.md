@@ -109,6 +109,8 @@ productName 加变体名**——它同时决定 Windows 安装目录与 WebView2
 三入口切内核 UI 不受影响——未打包的内核可经设置页下载。
 ```
 
+CI 的三内核+规则集下载挂 `actions/cache`（path=`resources/bin/<平台>`+`resources/rule-sets`，key=对应平台 fetch 脚本内容 hash——升版本自动失效，命中即零外网下载），fetch 步骤统一经 `scripts/ci-fetch-with-retry.sh` 执行（3 次尝试/间隔 30s 退避，应对托管 runner 偶发连不上 github.com 的网络抖动；.ps1 自动用 pwsh 跑）；`windows-portable` job 用与 release Windows 条目相同的 key 复用缓存并预取。
+
 打包脚本会自动拉取对应平台的官方内核并打进安装包，无需手动准备（mihomo geodata 例外，见下）。
 
 ### 资源预取（可选，离线/加速用）
@@ -135,6 +137,8 @@ scripts/memory-profile/                           # WebView2 内存剖析（CDP 
   `src-tauri/resources/geodata/mihomo/`（git 跟踪的固定快照）复制。上游 MetaCubeX/meta-rules-dat 只维护
   滚动的 `latest` release、没有版本化 tag，无法像内核二进制一样 pin URL；刷新快照需手动执行
   `scripts/fetch-bundled-mihomo-geodata.sh` 后 `git add` 提交。
+
+- 全部 fetch 脚本**幂等且版本感知**：目标二进制已 staged 且 `*-version.txt` 与脚本内置版本一致即跳过（升版本重跑自动刷新，不会停留在旧内核）；`build-dmg.sh` / `build-windows.ps1` 无条件调用它们——跳过判断的单一真源在 fetch 脚本内，外层不再做「文件存在就不调」的门控（旧门控会在升版本后静默打包旧内核）。CI 批量入口为 `scripts/ci-fetch-with-retry.sh`。
 
 - 这些二进制**不入 git**（`.gitignore` 排除 `resources/bin/**/sing-box*`、`xray*`、`mihomo*`、`*.dat`、`wintun.dll`、`mihomo-geodata/`、`libcronet.*`、`resources/rule-sets/*.srs`），本地缺失属正常；
   唯独 `src-tauri/resources/geodata/mihomo/`（country.mmdb + geosite.dat 快照）**入 git**，不在排除列表内
