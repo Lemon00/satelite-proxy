@@ -143,7 +143,6 @@ scripts/memory-profile/                           # WebView2 内存剖析（CDP 
 - 这些二进制**不入 git**（`.gitignore` 排除 `resources/bin/**/sing-box*`、`xray*`、`mihomo*`、`*.dat`、`wintun.dll`、`mihomo-geodata/`、`libcronet.*`、`resources/rule-sets/*.srs`），本地缺失属正常；
   唯独 `src-tauri/resources/geodata/mihomo/`（country.mmdb + geosite.dat 快照）**入 git**，不在排除列表内
 - 图标再生成：`python scripts/generate-icons.py`（依赖 Pillow，产出应用图标 + 8 种托盘图标；应用图标不再程序绘制，而是重采样源图 `assets/icon/ic_launcher-web.png`（512px 笑脸砖；该目录其余文件为 Interstellar 安卓素材、.gitignore 排除），icns 为纯 Python 写入、无需 macOS iconutil，Windows 上也能全量再生成）
-- 接管模式托盘变体（**已回退，未接线**）：`python scripts/generate-tray-variants.py`（依赖 Pillow；从各 `<style>-on.png` 生成 `<style>-sys.png`（系统代理）/`<style>-tun.png`（TUN）共 16 张，现效果=图标本体换色：彩色像素色相替换为状态色、保留明度与透明度，黑色部分不动；历史迭代过堆叠错位阴影、柔和 elevation 投影两版均被否）。**2026-09 实测接线后回退**——托盘实际观感不理想，TUN/系统代理态仍显示默认 `-on` 图标；脚本与 16 张图保留备用（未被代码引用），重接时把 `tray_png` 恢复三元组签名即可。色值源自 `src/theme/accents.ts` 的 day 深色档：sys=天蓝 #2E86C8、tun=香芋 #8E5BB8；支持 `--preview`、`--only sys|tun`、`--sys-color/--tun-color`
 
 ## 2. 项目是什么
 
