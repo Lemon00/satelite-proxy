@@ -116,6 +116,13 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS runners stamp files with the com.apple.provenance xattr;
+          # the action's `tar` then trips over Apple metadata handling
+          # ("Operation not permitted") while packaging the .app into the
+          # .app.tar.gz release asset (seen first on the v1.0.33 arm64 run).
+          # COPYFILE_DISABLE makes bsdtar skip AppleDouble/xattr encoding
+          # entirely — no-op on Linux/Windows.
+          COPYFILE_DISABLE: "1"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Satelite ${{ github.ref_name }}"
