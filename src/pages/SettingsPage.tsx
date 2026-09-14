@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -25,7 +24,6 @@ import { GlassSeg } from "../components/GlassSeg";
 import { GlassSwitchControl } from "../components/GlassSwitchControl";
 import { ErrorModal } from "../components/ErrorModal";
 import { TrayIconPicker } from "../components/TrayIconPicker";
-import { DecryptReveal } from "../components/DecryptReveal";
 import { CoreMark } from "../components/CoreMark";
 import {
   beginCoreDownload,
@@ -33,7 +31,6 @@ import {
   setCoreDownloadError,
   useCoreDownloadState,
 } from "../coreDownload";
-import buymecoffeeUrl from "../assets/buymecoffee.png";
 import { useI18n, type Locale, type MessageKey } from "../i18n";
 import { ACCENTS, applyGlowToDom, isCustomHexAccent, resolveAccent } from "../theme/accents";
 import { AccentColorPickerModal } from "../components/AccentColorPickerModal";
@@ -113,37 +110,9 @@ export function SettingsPage() {
     useTheme();
   const [tab, setTab] = useState<SettingsTab>("app");
   const [settings, setSettings] = useState<AppSettings | null>(null);
-  /** Sponsor QR panel (decrypt-reveal over the image). */
-  const [sponsorOpen, setSponsorOpen] = useState(false);
-  const [sponsorSession, setSponsorSession] = useState("0000");
   /** Custom accent color picker (the extra swatch after the presets). */
   const [accentPickerOpen, setAccentPickerOpen] = useState(false);
   const [glowPickerOpen, setGlowPickerOpen] = useState(false);
-  /** Anchor + viewport position for the sponsor popup (portaled to <body>,
-   * fixed above the trigger button so opening it never reflows the card). */
-  const sponsorBtnRef = useRef<HTMLButtonElement | null>(null);
-  const [sponsorPos, setSponsorPos] = useState<{ top: number; right: number } | null>(
-    null,
-  );
-
-  // Click outside the panel/link dismisses it. Ignore clicks inside either
-  // node: the link is portaled to <body>, so React stopPropagation does not
-  // reliably reach this native document listener.
-  useEffect(() => {
-    if (!sponsorOpen) return;
-    const close = (e: MouseEvent) => {
-      const node = e.target;
-      if (
-        node instanceof Element &&
-        node.closest(".sponsor-panel, .sponsor-link")
-      ) {
-        return;
-      }
-      setSponsorOpen(false);
-    };
-    document.addEventListener("click", close);
-    return () => document.removeEventListener("click", close);
-  }, [sponsorOpen]);
   const [mixed, setMixed] = useState("2080");
   /** Main mixed inbound listens on 0.0.0.0 (LAN) instead of 127.0.0.1. */
   const [allowLan, setAllowLan] = useState(false);
@@ -1039,13 +1008,6 @@ export function SettingsPage() {
     return () => document.removeEventListener("keydown", onKey);
   }, [tabs, customRuntime, visibleTab]);
 
-  // The sponsor easter egg renders on the app tab only; leaving the tab
-  // unmounts it — reset the open state so coming back doesn't resurrect
-  // a stale panel.
-  useEffect(() => {
-    if (visibleTab !== "app") setSponsorOpen(false);
-  }, [visibleTab]);
-
   const needsSettings =
     visibleTab === "app" || visibleTab === "ports" || visibleTab === "core";
   if (needsSettings && !settings && !error) {
@@ -1063,8 +1025,8 @@ export function SettingsPage() {
         </div>
       </header>
 
-      {/* Corner links moved into the version tab's app card (project home +
-       * sponsor easter egg live next to the app's own version info). */}
+      {/* Corner links live in the version tab's app card (project home lives
+       * next to the app's own version info). */}
 
       <GlassSeg
         value={visibleTab}
@@ -1909,83 +1871,7 @@ export function SettingsPage() {
               >
                 {t("settings.projectHome")}
               </button>
-              <button
-                type="button"
-                className="corner-link sponsor-link"
-                ref={sponsorBtnRef}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const rect = sponsorBtnRef.current?.getBoundingClientRect();
-                  if (rect) {
-                    // Popup bounds (QR 216 + padding + session chrome).
-                    const PANEL_W = 246;
-                    const PANEL_H = 302;
-                    const right = Math.min(
-                      Math.max(12, window.innerWidth - rect.right),
-                      Math.max(12, window.innerWidth - PANEL_W - 12),
-                    );
-                    const top =
-                      rect.top - PANEL_H - 10 >= 12
-                        ? rect.top - PANEL_H - 10
-                        : Math.min(
-                            rect.bottom + 10,
-                            window.innerHeight - PANEL_H - 12,
-                          );
-                    setSponsorPos({ top, right });
-                  }
-                  setSponsorOpen((v) => {
-                    if (!v) {
-                      setSponsorSession(
-                        Math.floor(Math.random() * 0xffff)
-                          .toString(16)
-                          .padStart(4, "0"),
-                      );
-                    }
-                    return !v;
-                  });
-                }}
-              >
-                {t("settings.sponsor")}
-              </button>
             </div>
-
-            {createPortal(
-              sponsorOpen && (
-                <div
-                  className="sponsor-panel sponsor-session"
-                  role="dialog"
-                  aria-label={t("settings.sponsor")}
-                  onClick={(e) => e.stopPropagation()}
-                  style={
-                    sponsorPos
-                      ? {
-                          top: sponsorPos.top,
-                          right: sponsorPos.right,
-                          bottom: "auto",
-                        }
-                      : undefined
-                  }
-                >
-                  <div className="sponsor-session-bar" aria-hidden="true">
-                    <span>session {sponsorSession}</span>
-                    <span className="sponsor-cursor" />
-                  </div>
-                  <div className="sponsor-session-view">
-                    <DecryptReveal radius={140} dismissOnLeave>
-                      <img
-                        className="sponsor-qr"
-                        src={buymecoffeeUrl}
-                        alt={t("settings.sponsorScan")}
-                        draggable={false}
-                      />
-                    </DecryptReveal>
-                  </div>
-                  <pre className="sponsor-session-foot" aria-hidden="true">{`payload: beer.qr
-; optional :p`}</pre>
-                </div>
-              ),
-              document.body,
-            )}
           </div>
         </section>
       )}
