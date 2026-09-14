@@ -76,6 +76,20 @@ const PROJECT_URL = "https://github.com/zn0wii/satelite-proxy/";
 /** Always-latest app release page, opened from the version tab. */
 const RELEASES_URL = "https://github.com/zn0wii/satelite-proxy/releases/latest";
 
+// Session-level memory of the latest MANUAL core update check. The network
+// check fires only on the per-core "检查" button (2026-09: it used to fire
+// for all three cores on every settings-page mount, hammering GitHub on each
+// nav switch) — this snapshot just keeps an already-fetched result visible
+// across page remounts (key={nav} destroys the state) without any network
+// traffic. An entry is dropped as soon as the installed version no longer
+// matches the one it was computed against (stale after download/restore).
+type CoreLatestSnapshot = {
+  local_version: string | null;
+  latest_version: string;
+  update_available: boolean;
+};
+const coreLatestSnapshots = new Map<CoreKind, CoreLatestSnapshot>();
+
 // Accent preset names are picked from the i18n catalog rather than
 // AccentPreset.name (theme/accents.ts), which is display data only and not
 // locale-aware.
@@ -249,35 +263,40 @@ export function SettingsPage() {
     [t],
   );
 
-  const runCoreUpdateCheck = useCallback(
-    async (kind: CoreKind, localVersion: string | null, reportError: boolean) => {
-      setCoreCheckingKind(kind);
-      if (reportError) setCoreError(null);
-      try {
-        const update = await checkCoreUpdate(kind, localVersion);
-        setCores((prev) => {
-          const info = prev[kind];
-          if (!info) return prev;
-          return {
-            ...prev,
-            [kind]: {
-              ...info,
-              latest_version: update.latest_version,
-              update_available: update.update_available,
-            },
-          };
-        });
-      } catch (e) {
-        if (reportError) {
-          setCoreError(typeof e === "string" ? e : String(e));
-        }
-      } finally {
-        setCoreCheckingKind(null);
-      }
-    },
-    [],
-  );
+  // Manual-only ("检查" button): hits the network on every click. The result
+  // is mirrored into the session snapshot so remounts keep showing it.
+  const runCoreUpdateCheck = useCallback(async (kind: CoreKind, localVersion: string | null) => {
+    setCoreCheckingKind(kind);
+    setCoreError(null);
+    try {
+      const update = await checkCoreUpdate(kind, localVersion);
+      coreLatestSnapshots.set(kind, {
+        local_version: localVersion,
+        latest_version: update.latest_version,
+        update_available: update.update_available,
+      });
+      setCores((prev) => {
+        const info = prev[kind];
+        if (!info) return prev;
+        return {
+          ...prev,
+          [kind]: {
+            ...info,
+            latest_version: update.latest_version,
+            update_available: update.update_available,
+          },
+        };
+      });
+    } catch (e) {
+      setCoreError(typeof e === "string" ? e : String(e));
+    } finally {
+      setCoreCheckingKind(null);
+    }
+  }, []);
 
+  // Local core status only — no version check here. Latest-release lookups
+  // are manual-only (and rate-limited by being click-driven); overlaying the
+  // session snapshot below is purely in-memory.
   const reloadCore = useCallback(async () => {
     setCoreError(null);
     try {
@@ -287,14 +306,26 @@ export function SettingsPage() {
         getCoreInfo("mihomo"),
       ]);
       const [singbox, xray, mihomo] = results;
-      setCores({ singbox, xray, mihomo });
-      void runCoreUpdateCheck("singbox", singbox.version ?? null, false);
-      void runCoreUpdateCheck("xray", xray.version ?? null, false);
-      void runCoreUpdateCheck("mihomo", mihomo.version ?? null, false);
+      const next: Record<CoreKind, CoreInfo> = { singbox, xray, mihomo };
+      for (const kind of Object.keys(next) as CoreKind[]) {
+        const snap = coreLatestSnapshots.get(kind);
+        if (!snap) continue;
+        if (snap.local_version !== next[kind].version) {
+          // Binary changed since the check (download/restore) — stale.
+          coreLatestSnapshots.delete(kind);
+          continue;
+        }
+        next[kind] = {
+          ...next[kind],
+          latest_version: snap.latest_version,
+          update_available: snap.update_available,
+        };
+      }
+      setCores(next);
     } catch (e) {
       setCoreError(typeof e === "string" ? e : String(e));
     }
-  }, [runCoreUpdateCheck]);
+  }, []);
 
   useEffect(() => {
     getSettings()
@@ -655,7 +686,7 @@ export function SettingsPage() {
   }
 
   async function onCheckCoreUpdate(kind: CoreKind) {
-    await runCoreUpdateCheck(kind, cores[kind]?.version ?? null, true);
+    await runCoreUpdateCheck(kind, cores[kind]?.version ?? null);
   }
 
   /** Core card "factory reset": with a bundled copy, drop the user-downloaded
@@ -788,11 +819,6 @@ export function SettingsPage() {
           <span className="mono">
             {t("settings.coreLatestShort")} {info?.latest_version ?? "—"}
           </span>
-          {info?.installed_at ? (
-            <span className="mono">
-              {t("settings.coreInstalledAt")} {formatCheckedAt(info.installed_at)}
-            </span>
-          ) : null}
           {info?.update_available ? (
             <span className="pill warn">{t("settings.coreUpdateAvail")}</span>
           ) : null}
@@ -884,23 +910,41 @@ export function SettingsPage() {
     }
   }
 
-  /** Protocols a sidecar core can carry (CoreKind=Xray support surface).
-   *  Nodes whose exact transport combo Xray rejects (e.g. REALITY+ws) fall
-   *  back to native sing-box outbounds at build time. */
-  const MULTICORE_PROTOCOLS: { value: string; label: string }[] = [
-    { value: "vmess", label: "VMess" },
-    { value: "vless", label: "VLESS" },
-    { value: "shadowsocks", label: "Shadowsocks" },
-    { value: "trojan", label: "Trojan" },
-    { value: "hysteria2", label: "Hysteria2" },
-    { value: "socks5", label: "SOCKS5" },
-    { value: "http", label: "HTTP" },
-    { value: "wireguard", label: "WireGuard" },
+  /** Protocols a sidecar core can carry, with per-row target cores from the
+   *  Rust support surface: every listed protocol is mihomo-capable (negative
+   *  list), and all but masque are also Xray-capable — so e.g. hysteria2 can
+   *  egress through either sidecar. masque is mihomo-only (sing-box/Xray
+   *  both lack a masque outbound): its "auto" state has no native fallback,
+   *  the nodes are simply filtered, so the option reads 未启用 instead of
+   *  follow-main. WireGuard stays Xray-labeled to match the existing plan
+   *  behavior (endpoint-shaped, excluded from delegation in
+   *  `compute_sidecar_plan`). Nodes whose exact transport combo the target
+   *  core rejects (e.g. REALITY+ws on Xray) fall back to native sing-box
+   *  outbounds at build time. */
+  const MULTICORE_PROTOCOLS: {
+    value: string;
+    label: string;
+    cores: string[];
+    autoDisabled?: boolean;
+  }[] = [
+    { value: "vmess", label: "VMess", cores: ["xray", "mihomo"] },
+    { value: "vless", label: "VLESS", cores: ["xray", "mihomo"] },
+    { value: "shadowsocks", label: "Shadowsocks", cores: ["xray", "mihomo"] },
+    { value: "trojan", label: "Trojan", cores: ["xray", "mihomo"] },
+    { value: "hysteria2", label: "Hysteria2", cores: ["xray", "mihomo"] },
+    { value: "socks5", label: "SOCKS5", cores: ["xray", "mihomo"] },
+    { value: "http", label: "HTTP", cores: ["xray", "mihomo"] },
+    { value: "wireguard", label: "WireGuard", cores: ["xray"] },
+    {
+      value: "masque",
+      label: "MASQUE",
+      cores: ["mihomo"],
+      autoDisabled: true,
+    },
   ];
-  const delegatedProtocols = new Set(
-    (settings?.protocol_cores ?? [])
-      .filter((e) => e.core === "xray")
-      .map((e) => e.protocol),
+  /** protocol → pinned sidecar core ("auto" = follow the main core). */
+  const pinnedCores = new Map(
+    (settings?.protocol_cores ?? []).map((e) => [e.protocol, e.core]),
   );
   /** Multi-core only exists under the sing-box main core; switching cores
    *  auto-disables it (backend mirrors this in set_core_type). */
@@ -1113,59 +1157,45 @@ export function SettingsPage() {
 
               {settings.multi_core_enabled && (
                 <div className="sidecar-body">
-                  <div className="table-wrap">
-                    <table className="multicore-table">
-                      <colgroup>
-                        <col />
-                        <col style={{ width: 170 }} />
-                      </colgroup>
-                      <thead>
-                        <tr>
-                          <th>{t("settings.multiCoreProtocolCol")}</th>
-                          <th>{t("settings.multiCoreCoreCol")}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {MULTICORE_PROTOCOLS.map((p) => (
-                          <tr key={p.value}>
-                            <td>
-                              <code>{p.label}</code>
-                              {delegatedProtocols.has(p.value) ? (
-                                <span className="pill sidecar-pill sidecar-tag">
-                                  Xray
-                                </span>
-                              ) : null}
-                            </td>
-                            <td>
-                              <SolidSelect
-                                value={
-                                  delegatedProtocols.has(p.value)
-                                    ? "xray"
-                                    : "auto"
-                                }
-                                aria-label={p.label}
-                                disabled={customRuntime}
-                                onChange={(v) =>
-                                  onProtocolCoreChange(p.value, v)
-                                }
-                                options={[
-                                  {
-                                    value: "auto",
-                                    label: t("settings.multiCoreFollowMain"),
-                                  },
-                                  { value: "xray", label: "Xray" },
-                                ]}
-                              />
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                  <div className="multicore-grid">
+                    {MULTICORE_PROTOCOLS.map((p) => {
+                      const pinned = pinnedCores.get(p.value);
+                      const pinInTargets =
+                        pinned !== undefined && p.cores.includes(pinned);
+                      const currentValue =
+                        pinInTargets && pinned ? pinned : "auto";
+                      return (
+                        <div className="multicore-row" key={p.value}>
+                          <code>{p.label}</code>
+                          <SolidSelect
+                            value={currentValue}
+                            aria-label={p.label}
+                            disabled={customRuntime}
+                            onChange={(v) =>
+                              onProtocolCoreChange(p.value, v)
+                            }
+                            options={[
+                              {
+                                value: "auto",
+                                label: p.autoDisabled
+                                  ? t("settings.multiCoreMasqueDisabled")
+                                  : t("settings.multiCoreFollowMain"),
+                              },
+                              ...p.cores.map((c) =>
+                                c === "xray"
+                                  ? { value: c, label: "Xray" }
+                                  : { value: c, label: "mihomo" },
+                              ),
+                            ]}
+                          />
+                        </div>
+                      );
+                    })}
                   </div>
                   <div className="field-hint muted">
                     {t("settings.multiCoreTableHint")}
                   </div>
-                  {delegatedProtocols.size === 0 && (
+                  {pinnedCores.size === 0 && (
                     <div className="field-hint sidecar-warn">
                       {t("settings.multiCoreNoProtocols")}
                     </div>

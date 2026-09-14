@@ -17,7 +17,7 @@ mkdir -p "$OUT_DIR/mihomo-geodata"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-if [[ ! -f "$OUT_DIR/mihomo" ]]; then
+if [[ ! -f "$OUT_DIR/mihomo" || "$(cat "$OUT_DIR/mihomo-version.txt" 2>/dev/null)" != "v${VER}" ]]; then
   echo "Downloading $URL …"
   curl -fL --retry 3 -o "$TMP/$ASSET" "$URL"
   # mihomo linux assets are a bare gzipped binary.
@@ -25,7 +25,7 @@ if [[ ! -f "$OUT_DIR/mihomo" ]]; then
   chmod +x "$OUT_DIR/mihomo"
   echo "v${VER}" > "$OUT_DIR/mihomo-version.txt"
 else
-  echo "mihomo already present, skipping download."
+  echo "mihomo v${VER} already staged, skipping download."
 fi
 
 # mihomo geodata: Country.mmdb + GeoSite.dat, staged from the repo-committed

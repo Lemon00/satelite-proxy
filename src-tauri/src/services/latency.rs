@@ -8,10 +8,12 @@
 //!   mapping into the running config (custom sing-box profiles). UDP-only
 //!   protocols (hysteria/hysteria2/tuic) have no TCP fallback at all —
 //!   without the core they report an explicit "start the proxy" error.
-//! - **Smart switch**: ranks candidates with [`probe_nodes_ranked`] — TCP
-//!   ping for TCP-capable nodes (a better speed correlate in practice), the
-//!   through-kernel URL probe only for QUIC-only protocols and for the
-//!   current node's health confirmation.
+//! - **Smart switch**: `probe_nodes_ranked` (TCP ping for TCP-capable
+//!   nodes, kernel URL probe for QUIC-only) is the cheap ORDERING
+//!   pre-filter; every pick that matters — exit patrol, candidate
+//!   verification, the current-node comparison baseline — is a
+//!   `probe_nodes` through-kernel URL probe, so no switch is ever made on
+//!   ping alone (see smart_switch).
 //!
 //! Clash path uses **unified delay** (like mihomo / FlClash): probe twice and
 //! report the second RTT so handshake / cold-connect bias is reduced.
@@ -75,8 +77,16 @@ pub async fn probe_nodes(
     clash: Option<ClashApi>,
     probe_url: String,
 ) -> AppResult<Vec<LatencyResult>> {
-    probe_nodes_streaming(nodes, timeout_ms, concurrency, clash, probe_url, |_| {}, true)
-        .await
+    probe_nodes_streaming(
+        nodes,
+        timeout_ms,
+        concurrency,
+        clash,
+        probe_url,
+        |_| {},
+        true,
+    )
+    .await
 }
 
 /// Same as [`probe_nodes`], but invokes `on_result` the moment each probe
@@ -350,7 +360,9 @@ where
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
     };
+    let key_wait_started = Instant::now();
     let _key_guard = probe_lock.lock().await;
+    let key_wait = key_wait_started.elapsed();
     // Double-check behind the lock — but only when reading cache is allowed
     // at all; a bypass run must really probe even if another caller just
     // finished one.
@@ -360,11 +372,27 @@ where
         }
     }
 
+    let permit_started = Instant::now();
     let _global_permit = Arc::clone(&GLOBAL_SEMAPHORE)
         .acquire_owned()
         .await
         .expect("global probe semaphore");
+    let permit_wait = permit_started.elapsed();
+    let probe_started = Instant::now();
     let result = probe().await;
+    let probe_took = probe_started.elapsed();
+    // Slow-probe diagnostics: with per-key merging and a global concurrency
+    // cap, a probe's wall time far above its own budget means queueing —
+    // these lines pinpoint which layer ate the wait (2026-09-13 incident).
+    let total = key_wait_started.elapsed();
+    if total > Duration::from_secs(5) {
+        crate::app_log::debug(
+            "probe",
+            format!(
+                "slow probe: key_wait={key_wait:?} permit_wait={permit_wait:?} probe={probe_took:?} total={total:?}"
+            ),
+        );
+    }
     cache_result(key.clone(), result.clone());
     let mut locks = PROBE_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
     if locks
@@ -688,15 +716,11 @@ mod tests {
             let key = key.clone();
             let calls = Arc::clone(&calls);
             tasks.push(tokio::spawn(async move {
-                probe_coalesced(
-                    key,
-                    true,
-                    || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        result(Some(42))
-                    },
-                )
+                probe_coalesced(key, true, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    result(Some(42))
+                })
                 .await
             }));
         }
@@ -705,13 +729,9 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let cached = probe_coalesced(
-            key,
-            true,
-            || async {
-                panic!("fresh successful result must be reused");
-            },
-        )
+        let cached = probe_coalesced(key, true, || async {
+            panic!("fresh successful result must be reused");
+        })
         .await;
         assert_eq!(cached.latency_ms, Some(42));
     }
@@ -727,40 +747,28 @@ mod tests {
 
         // Prime the cache with Some(1).
         let c = Arc::clone(&calls);
-        let primed = probe_coalesced(
-            key.clone(),
-            true,
-            || async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                result(Some(1))
-            },
-        )
+        let primed = probe_coalesced(key.clone(), true, || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            result(Some(1))
+        })
         .await;
         assert_eq!(primed.latency_ms, Some(1));
 
         // Bypass run: must really probe (Some(2)) despite the fresh hit.
         let c = Arc::clone(&calls);
-        let fresh = probe_coalesced(
-            key.clone(),
-            false,
-            || async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                result(Some(2))
-            },
-        )
+        let fresh = probe_coalesced(key.clone(), false, || async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            result(Some(2))
+        })
         .await;
         assert_eq!(fresh.latency_ms, Some(2));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         // The bypass run refreshed the cache: readers now get Some(2), and
         // no third probe ran.
-        let cached = probe_coalesced(
-            key,
-            true,
-            || async {
-                panic!("bypass result must have refreshed the cache");
-            },
-        )
+        let cached = probe_coalesced(key, true, || async {
+            panic!("bypass result must have refreshed the cache");
+        })
         .await;
         assert_eq!(cached.latency_ms, Some(2));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -775,17 +783,13 @@ mod tests {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
             tasks.push(tokio::spawn(async move {
-                probe_coalesced(
-                    unique_key(&format!("global-{i}")),
-                    true,
-                    || async move {
-                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(now, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(15)).await;
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        result(Some(10))
-                    },
-                )
+                probe_coalesced(unique_key(&format!("global-{i}")), true, || async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    result(Some(10))
+                })
                 .await
             }));
         }

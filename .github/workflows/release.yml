@@ -82,39 +82,32 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # Cores + rule sets are pure downloads keyed by the fetch scripts'
+      # content hash: bumping a pinned version changes the key and forces a
+      # fresh download; everything else restores from cache (zero network).
+      - name: Bundled cores cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            src-tauri/resources/bin/${{ matrix.core-dir }}
+            src-tauri/resources/rule-sets
+          key: bundled-cores-${{ matrix.core-dir }}-${{ hashFiles(matrix.fetch-core, matrix.fetch-xray, matrix.fetch-mihomo, 'scripts/fetch-bundled-rule-sets.sh') }}
+
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Fetch bundled sing-box core (Unix)
-        if: runner.os != 'Windows'
-        run: ${{ matrix.fetch-core }}
-
-      - name: Fetch bundled sing-box core (Windows)
-        if: runner.os == 'Windows'
-        run: pwsh ${{ matrix.fetch-core }}
-
-      - name: Fetch bundled Xray core (Unix)
-        if: runner.os != 'Windows' && matrix.fetch-xray != ''
-        run: ${{ matrix.fetch-xray }}
-
-      - name: Fetch bundled Xray core (Windows)
-        if: runner.os == 'Windows' && matrix.fetch-xray != ''
-        run: pwsh ${{ matrix.fetch-xray }}
-
-      - name: Fetch bundled mihomo core (Unix)
-        if: runner.os != 'Windows' && matrix.fetch-mihomo != ''
-        run: ${{ matrix.fetch-mihomo }}
-
-      - name: Fetch bundled mihomo core (Windows)
-        if: runner.os == 'Windows' && matrix.fetch-mihomo != ''
-        run: pwsh ${{ matrix.fetch-mihomo }}
-
-      - name: Fetch bundled rule sets
-        run: scripts/fetch-bundled-rule-sets.sh
+      # The fetch scripts skip on their own when the pinned version is
+      # already staged, so cache hits stay offline; misses go through
+      # ci-fetch-with-retry.sh (30s backoff) to ride out runner network blips.
+      - name: Fetch bundled cores & rule sets
         shell: bash
+        run: >
+          bash scripts/ci-fetch-with-retry.sh
+          ${{ matrix.fetch-core }} ${{ matrix.fetch-xray }} ${{ matrix.fetch-mihomo }}
+          scripts/fetch-bundled-rule-sets.sh
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -123,6 +116,13 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS runners stamp files with the com.apple.provenance xattr;
+          # the action's `tar` then trips over Apple metadata handling
+          # ("Operation not permitted") while packaging the .app into the
+          # .app.tar.gz release asset (seen first on the v1.0.33 arm64 run).
+          # COPYFILE_DISABLE makes bsdtar skip AppleDouble/xattr encoding
+          # entirely — no-op on Linux/Windows.
+          COPYFILE_DISABLE: "1"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Satelite ${{ github.ref_name }}"
@@ -137,6 +137,27 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Same key as the release job's windows-amd64 matrix entry, so the
+      # portable zip reuses the cache the release build just saved.
+      - name: Bundled cores cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            src-tauri/resources/bin/windows-amd64
+            src-tauri/resources/rule-sets
+          key: bundled-cores-windows-amd64-${{ hashFiles('scripts/fetch-bundled-core-windows-amd64.ps1', 'scripts/fetch-bundled-xray-windows-amd64.ps1', 'scripts/fetch-bundled-mihomo-windows-amd64.ps1', 'scripts/fetch-bundled-rule-sets.sh') }}
+
+      # build-windows.ps1 fetches missing cores without any retry; prefetch
+      # here so the downloads get the same retry treatment as the release job.
+      - name: Prefetch bundled cores & rule sets
+        shell: bash
+        run: >
+          bash scripts/ci-fetch-with-retry.sh
+          scripts/fetch-bundled-core-windows-amd64.ps1
+          scripts/fetch-bundled-xray-windows-amd64.ps1
+          scripts/fetch-bundled-mihomo-windows-amd64.ps1
+          scripts/fetch-bundled-rule-sets.sh
 
       - name: Setup Node
         uses: actions/setup-node@v4

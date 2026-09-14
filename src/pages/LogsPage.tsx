@@ -167,7 +167,10 @@ export function LogsPage() {
       const jobs: Promise<unknown>[] = [getProxyStatus().then((s) => {
         const next = new Set<string>();
         if (s.running && s.core_type) next.add(s.core_type);
-        if (s.sidecar_running) next.add("xray");
+        // Sidecars light their own core's tab (xray / mihomo sidecars
+        // under the sing-box main core).
+        for (const kind of s.sidecar_kinds ?? []) next.add(kind);
+        if (!s.sidecar_kinds && s.sidecar_running) next.add("xray");
         setRunningKinds(next);
       }).catch(() => setRunningKinds(new Set()))];
       if (tab === "app") jobs.push(loadIncremental());
@@ -267,21 +270,18 @@ export function LogsPage() {
             checked={autoScroll}
             onChange={setAutoScroll}
             label={t("logs.autoScroll")}
-            title={t("logs.autoScroll")}
             capsule
             size="sm"
           />
           <GlassButton
             icon="↻"
             onClick={() => void (tab === "app" ? reload() : coreReload())}
-            title={t("common.refresh")}
           >
             {t("common.refresh")}
           </GlassButton>
           <GlassButton
             icon="⌫"
             onClick={() => void onClear()}
-            title={t("common.clear")}
           >
             {t("common.clear")}
           </GlassButton>
@@ -300,9 +300,6 @@ export function LogsPage() {
             value={minLevel}
             ariaLabel={t("logs.level")}
             onChange={(v) => setMinLevel(v as AppLogLevel)}
-            titles={Object.fromEntries(
-              LEVELS.map((lv) => [lv, `${t("logs.minLevel")}: ${lv}`]),
-            )}
             options={LEVELS.map((lv) => ({ value: lv, label: lv }))}
           />
         ) : (
@@ -310,9 +307,6 @@ export function LogsPage() {
             value={coreMinLevel}
             ariaLabel={t("logs.level")}
             onChange={(v) => setCoreMinLevel(v as CoreLogLevel)}
-            titles={Object.fromEntries(
-              CORE_LEVELS.map((lv) => [lv, `${t("logs.minLevel")}: ${lv}`]),
-            )}
             options={CORE_LEVELS.map((lv) => ({ value: lv, label: lv }))}
           />
         )}

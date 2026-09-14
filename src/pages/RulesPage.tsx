@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -17,6 +18,7 @@ import {
   getSettings,
   listAllNodes,
   listChains,
+  listPools,
   listRemoteRuleItems,
   listRuleSets,
   peekSettings,
@@ -28,6 +30,7 @@ import {
   resetBuiltinRuleSet,
   saveRule,
   setRuleEnabled,
+  setRuleSetDnsStrategy,
   setRuleSetEnabled,
   setRuleSetStrategy,
   refreshGeodata,
@@ -35,6 +38,7 @@ import {
   type GeodataInfo,
 } from "../api";
 import { GlassButton } from "../components/GlassButton";
+import { nodeTip } from "../nodeTooltip";
 import { SolidSelect } from "../components/SolidSelect";
 import { GlassSeg } from "../components/GlassSeg";
 import { GlassSwitchControl } from "../components/GlassSwitchControl";
@@ -42,6 +46,8 @@ import { ErrorModal } from "../components/ErrorModal";
 import { useI18n } from "../i18n";
 import { extractDomainSuffix } from "./FailuresPage";
 import type {
+  ChainHop,
+  NodePool,
   ProxyChain,
   ProxyNode,
   Rule,
@@ -53,6 +59,40 @@ import type {
 } from "../types";
 
 type RouteFinal = "proxy" | "direct" | "block";
+
+/** Decide the rule-row ⋮ menu direction at open time from real geometry:
+ *  open downward only while the room below the trigger — bounded by the
+ *  table card (overflow: hidden clips the popover, see .rules-table-wrap) —
+ *  fits the menu; otherwise open upward, escaping past the card's top edge
+ *  (the :has() lift in App.css lets it overlay the toolbar band). Replaces
+ *  the old "top 4 rows always flip down": a 1–3 row table has no room below
+ *  the last rows either, so the menu was clipped mid-air by the card. Same
+ *  walk-the-clipping-ancestors idiom as SolidSelect::shouldFlipUp — pure
+ *  getBoundingClientRect math, safe under the root CSS zoom. */
+function rowMenuOpensDown(trigger: HTMLElement): boolean {
+  // 编辑+删除 two items incl. padding/gap/offset; keep in sync with .rule-menu-pop.
+  const estHeight = 78;
+  let bottomLimit = window.innerHeight;
+  let topLimit = 0;
+  let node: HTMLElement | null = trigger.parentElement;
+  while (node && node !== document.body) {
+    const style = getComputedStyle(node);
+    const clips =
+      /(auto|scroll|hidden)/.test(style.overflow) ||
+      /(auto|scroll|hidden)/.test(style.overflowY);
+    if (clips) {
+      const rect = node.getBoundingClientRect();
+      bottomLimit = Math.min(bottomLimit, rect.bottom);
+      topLimit = Math.max(topLimit, rect.top);
+    }
+    node = node.parentElement;
+  }
+  const rect = trigger.getBoundingClientRect();
+  const roomBelow = bottomLimit - rect.bottom - 6;
+  const roomAbove = rect.top - topLimit - 6;
+  // Down when it fits; when neither side fits, pick the roomier one.
+  return roomBelow >= estHeight || roomBelow >= roomAbove;
+}
 
 /**
  * If `payload` is a pasted http(s) URL, suggest what it would actually
@@ -79,6 +119,89 @@ function suggestPayloadFromUrl(payload: string, ruleType: RuleType): string | nu
 }
 
 const REMOTE_PAGE_SIZE = 100;
+
+/** Batch entries for the match-content textarea: whitespace (spaces or
+ *  newlines) separates entries — one rule per entry on save. */
+function parsePayloadEntries(raw: string): string[] {
+  return raw
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Hostname label: alnum (unicode allowed — the backend punycodes it for the
+ *  kernel configs), inner hyphens, no leading/trailing hyphen. */
+const HOSTNAME_LABEL_RE = /^[\p{L}\p{N}]([\p{L}\p{N}-]*[\p{L}\p{N}])?$/u;
+
+/** Domain / domain-suffix shape: dot-separated labels, no scheme, path,
+ *  port or leading dot ("https://a.b" and ".com" both fail here). */
+function isValidHostnameShape(v: string): boolean {
+  return v.length <= 253 && v.split(".").every((l) => HOSTNAME_LABEL_RE.test(l));
+}
+
+/** IPv4: exactly four 0–255 octets, no leading zeros ("0" alone is fine). */
+function isValidIpv4(ip: string): boolean {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(p));
+}
+
+/** IPv6 via the WHATWG URL parser: `http://[...]` only parses for valid
+ *  literals, in both WebView2 and WKWebView. */
+function isValidIpv6(ip: string): boolean {
+  try {
+    new URL(`http://[${ip}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** IP-CIDR entry: bare IP or CIDR. Returns the normalized value — bare IPs
+ *  gain /32 // /128, since mihomo's IP-CIDR rejects bare IPs — or null when
+ *  invalid. Prefix must fit the address family (≤32 v4 / ≤128 v6). */
+function normalizeIpCidrEntry(v: string): string | null {
+  const slash = v.indexOf("/");
+  if (slash === -1) {
+    if (isValidIpv4(v)) return `${v}/32`;
+    if (isValidIpv6(v)) return `${v}/128`;
+    return null;
+  }
+  if (v.indexOf("/", slash + 1) !== -1) return null;
+  const ip = v.slice(0, slash);
+  const prefix = v.slice(slash + 1);
+  if (!/^\d{1,3}$/.test(prefix)) return null;
+  const bits = Number(prefix);
+  if (isValidIpv4(ip)) return bits <= 32 ? v : null;
+  if (isValidIpv6(ip)) return bits <= 128 ? v : null;
+  return null;
+}
+
+/** One invalid entry from the match-content textarea. */
+interface PayloadIssue {
+  index: number;
+  value: string;
+  kind: "domain" | "ip" | "process";
+}
+
+/** Validate batched match-content entries against the selected rule type;
+ *  domain keywords are free-form and never fail. */
+function validatePayloadEntries(
+  entries: string[],
+  type: RuleType,
+): PayloadIssue[] {
+  const issues: PayloadIssue[] = [];
+  entries.forEach((value, index) => {
+    if (type === "domain" || type === "domain_suffix") {
+      if (!isValidHostnameShape(value)) issues.push({ index, value, kind: "domain" });
+    } else if (type === "ip_cidr") {
+      if (normalizeIpCidrEntry(value) === null) issues.push({ index, value, kind: "ip" });
+    } else if (type === "process") {
+      if (/[/\\:]/.test(value)) issues.push({ index, value, kind: "process" });
+    }
+  });
+  return issues;
+}
 
 /** Builtin remote set id → the geodata matcher the Xray / mihomo generators
  *  emit instead of reading the .srs cache (and which geodata file backs it). */
@@ -149,6 +272,7 @@ export function RulesPage({ embedded = false }: Props) {
   const [chainId, setChainId] = useState<string>("");
   const [chains, setChains] = useState<ProxyChain[]>([]);
   const [nodes, setNodes] = useState<ProxyNode[]>([]);
+  const [pools, setPools] = useState<NodePool[]>([]);
   const [enabled, setEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
 
@@ -160,7 +284,7 @@ export function RulesPage({ embedded = false }: Props) {
   const [newSetTarget, setNewSetTarget] = useState<
     "proxy" | "direct" | "block" | "node" | "filter" | "chain"
   >("proxy");
-  const [newSetNodeId, setNewSetNodeId] = useState("");
+  const [newSetNodeIds, setNewSetNodeIds] = useState<string[]>([]);
   const [newSetNodeQuery, setNewSetNodeQuery] = useState("");
   const [newSetSmartInclude, setNewSetSmartInclude] = useState("");
   const [newSetSmartExclude, setNewSetSmartExclude] = useState("");
@@ -186,19 +310,19 @@ export function RulesPage({ embedded = false }: Props) {
    *  sentinel for RuleSetStrategy's per-rule "smart" strategy — it is not a
    *  settable RuleTarget, so it can never be the value the user picked. */
   const [editSetRouteTarget, setEditSetRouteTarget] = useState<RuleTarget | "mixed">("proxy");
-  const [editSetNodeId, setEditSetNodeId] = useState("");
+  /** Full node selection for the edit modal's 指定 picker: 1 pick = classic
+   *  single pin, 2+ = whole-set explicit pool. */
+  const [editSetNodeIds, setEditSetNodeIds] = useState<string[]>([]);
   const [editSetNodeQuery, setEditSetNodeQuery] = useState("");
   const [editSetSmartInclude, setEditSetSmartInclude] = useState("");
   const [editSetSmartExclude, setEditSetSmartExclude] = useState("");
   const [editSetChainId, setEditSetChainId] = useState("");
   const [editSetChainQuery, setEditSetChainQuery] = useState("");
   const [editSetBusy, setEditSetBusy] = useState(false);
-  /** First few rules of the set being edited, for the left column's summary
-   *  — fetched separately since the target set need not be the one currently
-   *  viewed. Cleared while loading so a stale set's rules never flash. */
-  const [editSetRulePreview, setEditSetRulePreview] = useState<Rule[]>([]);
   /** Row ⋮ menu open for this rule id */
   const [menuRuleId, setMenuRuleId] = useState<string | null>(null);
+  /** Direction of the open row ⋮ menu — decided per open via rowMenuOpensDown. */
+  const [menuRowDown, setMenuRowDown] = useState(false);
   /** Rule-set card ⋮ menu open for this set id. */
   const [menuSetId, setMenuSetId] = useState<string | null>(null);
   const [remoteBusyIds, setRemoteBusyIds] = useState<Set<string>>(new Set());
@@ -464,6 +588,12 @@ export function RulesPage({ embedded = false }: Props) {
     );
   }, [nodes, newSetNodeQuery]);
 
+  /** New-set picker rows: picked nodes pinned to the top. */
+  const newSetPickerNodes = useMemo(
+    () => pinPickedFirst(nodes, newSetFilteredNodes, newSetNodeIds),
+    [nodes, newSetFilteredNodes, newSetNodeIds],
+  );
+
   /** Node list for the edit-set modal's route-picker (own query). */
   const editSetFilteredNodes = useMemo(() => {
     const q = editSetNodeQuery.trim().toLowerCase();
@@ -475,6 +605,12 @@ export function RulesPage({ embedded = false }: Props) {
         n.protocol.toLowerCase().includes(q),
     );
   }, [nodes, editSetNodeQuery]);
+
+  /** Edit-set picker rows: picked nodes pinned to the top. */
+  const editSetPickerNodes = useMemo(
+    () => pinPickedFirst(nodes, editSetFilteredNodes, editSetNodeIds),
+    [nodes, editSetFilteredNodes, editSetNodeIds],
+  );
 
   /** Chain list for the edit-set modal's route-picker (own query). */
   const editSetFilteredChains = useMemo(() => {
@@ -489,6 +625,34 @@ export function RulesPage({ embedded = false }: Props) {
       .split(/\s+/)
       .map((s) => s.trim())
       .filter(Boolean);
+  }
+
+  /** Toggle one id in a multi-pick selection. */
+  function toggleInList(list: string[], id: string): string[] {
+    return list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
+  }
+
+  /** Picker row order for a multi-pick node list: picked rows pinned to the
+   *  top (in natural list order, regardless of the search query — the
+   *  selection stays reviewable while searching), then the query-matched
+   *  unpicked rows. */
+  function pinPickedFirst(all: ProxyNode[], filtered: ProxyNode[], picked: string[]): ProxyNode[] {
+    const top = all.filter((n) => picked.includes(n.id));
+    const rest = filtered.filter((n) => !picked.includes(n.id));
+    return [...top, ...rest];
+  }
+
+  /** A set's current node picks as one selection list: explicit pool members
+   *  when stored, else the legacy single pin (empty when unpinned). */
+  function setNodeSelection(s: RuleSetSummary): string[] {
+    if ((s.node_ids?.length ?? 0) >= 2) return [...(s.node_ids ?? [])];
+    return s.node_id ? [s.node_id] : [];
+  }
+
+  function sameIdSet(a: string[], b: string[]): boolean {
+    const na = [...new Set(a)].sort();
+    const nb = [...new Set(b)].sort();
+    return na.length === nb.length && na.every((x, i) => x === nb[i]);
   }
 
   /** Keywords present in both the whitelist and the blacklist (conflict). */
@@ -527,10 +691,25 @@ export function RulesPage({ embedded = false }: Props) {
     [target, smartInclude, smartExclude],
   );
 
-  const payloadSuggestion = useMemo(
-    () => suggestPayloadFromUrl(payload, ruleType),
-    [payload, ruleType],
+  /** Batched match-content entries + live per-entry validation for the
+   *  textarea (whitespace-separated, see parsePayloadEntries). */
+  const payloadEntries = useMemo(() => parsePayloadEntries(payload), [payload]);
+  const payloadIssues = useMemo(
+    () => validatePayloadEntries(payloadEntries, ruleType),
+    [payloadEntries, ruleType],
   );
+  /** Editing keeps single-entry semantics; batch is an add-time feature. */
+  const payloadEditMulti = editRule !== null && payloadEntries.length > 1;
+
+  /** URL suggestion for the first entry that still looks like a pasted URL,
+   *  kept with its index so the replace button only rewrites that entry. */
+  const payloadSuggestion = useMemo(() => {
+    for (let i = 0; i < payloadEntries.length; i++) {
+      const value = suggestPayloadFromUrl(payloadEntries[i], ruleType);
+      if (value) return { index: i, value };
+    }
+    return null;
+  }, [payloadEntries, ruleType]);
 
   /** Node count matching include/exclude keyword filters. Same semantics as
    *  the backend pool: blacklist OR skips, whitelist OR allows, empty
@@ -581,6 +760,21 @@ export function RulesPage({ embedded = false }: Props) {
         : 0,
     [editSetRouteTarget, editSetSmartInclude, editSetSmartExclude, nodes],
   );
+
+  /** Human labels for the selected chain's hops (node / pool names), shown as
+   *  a route stepper under the chain picker. */
+  const editSetChainHopLabels = useMemo(() => {
+    if (editSetRouteTarget !== "chain") return null;
+    const chain = chains.find((c) => c.id === editSetChainId);
+    if (!chain) return null;
+    const label = (hop: ChainHop) =>
+      hop.kind === "node"
+        ? (nodes.find((n) => n.id === hop.node_id)?.name ??
+          `#${hop.node_id.slice(0, 6)}`)
+        : (pools.find((p) => p.id === hop.pool_id)?.name ??
+          `#${hop.pool_id.slice(0, 6)}`);
+    return chain.hops.map(label);
+  }, [editSetRouteTarget, editSetChainId, chains, nodes, pools]);
 
   // Keep the DNS field in step with the route-derived recommendation until
   // the user explicitly overrides it in this dialog session.
@@ -723,7 +917,7 @@ export function RulesPage({ embedded = false }: Props) {
     if (editSetRouteTarget !== currentAsTarget) return false;
     switch (editSetRouteTarget) {
       case "node":
-        return editSetNodeId === (s.node_id ?? "");
+        return sameIdSet(editSetNodeIds, setNodeSelection(s));
       case "smart": {
         const sameSet = (a: string[], b: string[]) => {
           const na = [...new Set(a.map((x) => x.toLowerCase()))].sort();
@@ -740,6 +934,24 @@ export function RulesPage({ embedded = false }: Props) {
       default:
         return true;
     }
+  }
+
+  /** Whether ANY editable field of the edit-set modal differs from the set's
+   *  stored values — gates the Save button so a no-op edit can't be saved
+   *  (and can't trigger the route-reapply/restart hidden behind it). */
+  function editSetHasChanges(): boolean {
+    const s = editSetTarget;
+    if (!s) return false;
+    if (editSetName.trim() !== s.name) return true;
+    if (s.remote) {
+      if (editSetUrl.trim() !== s.remote.url) return true;
+      const stored = s.remote.update_interval;
+      const normalized =
+        stored === "1h" || stored === "12h" || stored === "24h" ? stored : "disabled";
+      if (editSetUpdateInterval !== normalized) return true;
+    }
+    if (editSetDnsStrategy !== s.dns_strategy) return true;
+    return !editSetRouteUnchanged(s);
   }
 
   function dnsStrategyLabel(s: string): string {
@@ -852,6 +1064,16 @@ export function RulesPage({ embedded = false }: Props) {
     }
   }
 
+  /** Node pools, for resolving chain-hop labels in the edit-set modal. */
+  async function ensurePoolsLoaded() {
+    try {
+      const list = await listPools();
+      setPools(list);
+    } catch {
+      setPools([]);
+    }
+  }
+
   function openCreate() {
     setEditRule(null);
     setRuleType("domain_suffix");
@@ -886,9 +1108,15 @@ export function RulesPage({ embedded = false }: Props) {
     void ensureChainsLoaded();
   }
 
-  async function onSave(e: FormEvent) {
-    e.preventDefault();
-    if (!viewSetId || !payload.trim() || plainDiverged) return;
+  /** Save (button-only — the form itself never submits). One textarea entry
+   *  = one rule: entries are saved sequentially so the backend's max-ord+10
+   *  assignment keeps the typed order, duplicates collapse onto the same
+   *  content-addressed rule id, and the 500ms rule-apply debounce merges
+   *  everything into a single core restart. */
+  async function doSave() {
+    if (!viewSetId || plainDiverged) return;
+    // Defensive: the save button is already disabled while any of these hold.
+    if (payloadEntries.length === 0 || payloadIssues.length > 0 || payloadEditMulti) return;
     // Smart sets honor the full target list; plain sets honor the per-rule
     // proxy/direct/block choice (the builder routes each rule separately).
     const effectiveTarget = clampTargetForSet(target);
@@ -906,22 +1134,32 @@ export function RulesPage({ embedded = false }: Props) {
       setError(t("rules.needChain"));
       return;
     }
+    // Order-preserving dedupe + per-type normalization (bare IPs → CIDR).
+    const entries = [
+      ...new Set(
+        ruleType === "ip_cidr"
+          ? payloadEntries.map(normalizeIpCidrEntry).filter((v): v is string => v !== null)
+          : payloadEntries,
+      ),
+    ];
     setBusy(true);
     setError(null);
     try {
-      await saveRule({
-        setId: viewSetId,
-        id: editRule?.id ?? null,
-        ruleType,
-        payload: payload.trim(),
-        target: effectiveTarget,
-        ord: editRule?.ord ?? null,
-        enabled,
-        nodeId: effectiveTarget === "node" ? pinNodeId : null,
-        smartInclude: effectiveTarget === "smart" ? parseKeywords(smartInclude) : null,
-        smartExclude: effectiveTarget === "smart" ? parseKeywords(smartExclude) : null,
-        chainId: effectiveTarget === "chain" ? chainId : null,
-      });
+      for (const entry of entries) {
+        await saveRule({
+          setId: viewSetId,
+          id: editRule?.id ?? null,
+          ruleType,
+          payload: entry,
+          target: effectiveTarget,
+          ord: editRule?.ord ?? null,
+          enabled,
+          nodeId: effectiveTarget === "node" ? pinNodeId : null,
+          smartInclude: effectiveTarget === "smart" ? parseKeywords(smartInclude) : null,
+          smartExclude: effectiveTarget === "smart" ? parseKeywords(smartExclude) : null,
+          chainId: effectiveTarget === "chain" ? chainId : null,
+        });
+      }
       setEditOpen(false);
       await reloadRules(viewSetId);
       await reloadSets();
@@ -1013,7 +1251,7 @@ export function RulesPage({ embedded = false }: Props) {
     setNewSetKind("local");
     setNewSetUrl("");
     setNewSetTarget("proxy");
-    setNewSetNodeId("");
+    setNewSetNodeIds([]);
     setNewSetNodeQuery("");
     setNewSetSmartInclude("");
     setNewSetSmartExclude("");
@@ -1034,7 +1272,7 @@ export function RulesPage({ embedded = false }: Props) {
       setError(t("rules.needName"));
       return;
     }
-    if (newSetTarget === "node" && !newSetNodeId.trim()) {
+    if (newSetTarget === "node" && newSetNodeIds.length === 0) {
       setError(t("rules.needNode"));
       return;
     }
@@ -1062,7 +1300,8 @@ export function RulesPage({ embedded = false }: Props) {
         // it to the whole-set Filter strategy.
         newSetTarget === "filter" ? "smart" : newSetTarget,
         newSetKind === "remote" ? newSetUpdateInterval : null,
-        newSetTarget === "node" ? newSetNodeId : null,
+        newSetTarget === "node" ? (newSetNodeIds[0] ?? null) : null,
+        newSetTarget === "node" ? newSetNodeIds : null,
         newSetTarget === "filter" ? parseKeywords(newSetSmartInclude) : null,
         newSetTarget === "filter" ? parseKeywords(newSetSmartExclude) : null,
         newSetTarget === "chain" ? newSetChainId : null,
@@ -1140,25 +1379,21 @@ export function RulesPage({ embedded = false }: Props) {
           ? "smart"
           : target.strategy,
     );
-    setEditSetNodeId(target.node_id ?? "");
+    setEditSetNodeIds(setNodeSelection(target));
     setEditSetNodeQuery("");
     setEditSetSmartInclude((target.smart_include ?? []).join(" "));
     setEditSetSmartExclude((target.smart_exclude ?? []).join(" "));
     setEditSetChainId(target.chain_id ?? "");
     setEditSetChainQuery("");
-    setEditSetRulePreview([]);
     void ensureNodesLoaded();
     void ensureChainsLoaded();
-    void getRuleSet(target.id).then(
-      (set) => setEditSetRulePreview([...set.rules].sort((a, b) => a.ord - b.ord).slice(0, 5)),
-      () => setEditSetRulePreview([]),
-    );
+    void ensurePoolsLoaded();
   }
 
   async function onEditSet(e: FormEvent) {
     e.preventDefault();
     if (!editSetTarget || !editSetName.trim() || editSetBusy) return;
-    if (editSetRouteTarget === "node" && !editSetNodeId.trim()) {
+    if (editSetRouteTarget === "node" && editSetNodeIds.length === 0) {
       setError(t("rules.needNode"));
       return;
     }
@@ -1199,7 +1434,8 @@ export function RulesPage({ embedded = false }: Props) {
         await batchSetRuleTargets(
           id,
           editSetRouteTarget,
-          editSetRouteTarget === "node" ? editSetNodeId : null,
+          editSetRouteTarget === "node" ? (editSetNodeIds[0] ?? null) : null,
+          editSetRouteTarget === "node" ? editSetNodeIds : null,
           editSetRouteTarget === "smart" ? parseKeywords(editSetSmartInclude) : null,
           editSetRouteTarget === "smart" ? parseKeywords(editSetSmartExclude) : null,
           editSetRouteTarget === "chain" ? editSetChainId : null,
@@ -1217,6 +1453,46 @@ export function RulesPage({ embedded = false }: Props) {
       setError(typeof err === "string" ? err : String(err));
     } finally {
       setEditSetBusy(false);
+    }
+  }
+
+  /** ⋮ menu quick action: switch the set's DNS resolver policy. */
+  async function onQuickDns(s: RuleSetSummary, strategy: RuleSetDnsStrategy) {
+    if (s.dns_strategy === strategy) return;
+    try {
+      await setRuleSetDnsStrategy(s.id, strategy);
+      await reloadSets();
+    } catch (err) {
+      setError(typeof err === "string" ? err : String(err));
+    }
+  }
+
+  /** ⋮ menu quick action: plain route flip or chain pick. Re-applies (and
+   *  restarts) only when the choice actually differs from the current route. */
+  async function onQuickRoute(
+    s: RuleSetSummary,
+    target: "proxy" | "direct" | "block" | "chain",
+    chainId?: string,
+  ) {
+    if (target === "chain") {
+      if (!chainId || (s.strategy === "chain" && s.chain_id === chainId)) return;
+    } else if (s.strategy === target) {
+      return;
+    }
+    try {
+      await batchSetRuleTargets(
+        s.id,
+        target,
+        null,
+        null,
+        null,
+        null,
+        target === "chain" ? chainId : null,
+      );
+      await reloadSets();
+      if (viewSetId === s.id) await reloadRules(s.id);
+    } catch (err) {
+      setError(typeof err === "string" ? err : String(err));
     }
   }
 
@@ -1441,6 +1717,8 @@ export function RulesPage({ embedded = false }: Props) {
                   e.stopPropagation();
                   setMenuRuleId(null);
                   setMenuSetId((id) => (id === s.id ? null : s.id));
+                  // Chain flyout in the route submenu needs the chain list.
+                  void ensureChainsLoaded();
                 }}
               >
                 ⋮
@@ -1452,6 +1730,115 @@ export function RulesPage({ embedded = false }: Props) {
                   }`}
                   role="menu"
                 >
+                  {s.strategy !== "block" && (
+                    <div className="rule-menu-subhost" role="none">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        aria-haspopup="menu"
+                        className="rule-menu-item rule-menu-sub-trigger"
+                      >
+                        {t("rules.setMenuDnsTitle")}
+                        <span className="rule-menu-caret" aria-hidden>›</span>
+                      </button>
+                      <div className="rule-menu-sub" role="menu">
+                        {(["local", "domestic", "remote"] as RuleSetDnsStrategy[]).map((v) => (
+                          <button
+                            key={v}
+                            type="button"
+                            role="menuitem"
+                            className="rule-menu-item"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setMenuSetId(null);
+                              void onQuickDns(s, v);
+                            }}
+                          >
+                            <span className={`menu-dot${s.dns_strategy === v ? " on" : ""}`} aria-hidden />
+                            {dnsStrategyLabel(v)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <div className="rule-menu-subhost" role="none">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      aria-haspopup="menu"
+                      className="rule-menu-item rule-menu-sub-trigger"
+                    >
+                      {t("rules.menuRouteLabel")}
+                      <span className="rule-menu-caret" aria-hidden>›</span>
+                    </button>
+                    <div className="rule-menu-sub" role="menu">
+                      {(["proxy", "direct", "block"] as const).map((target) => (
+                        <button
+                          key={target}
+                          type="button"
+                          role="menuitem"
+                          className="rule-menu-item"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setMenuSetId(null);
+                            void onQuickRoute(s, target);
+                          }}
+                        >
+                          <span className={`menu-dot${s.strategy === target ? " on" : ""}`} aria-hidden />
+                          {strategyLabel(target)}
+                        </button>
+                      ))}
+                      <div className="rule-menu-subhost" role="none">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          aria-haspopup="menu"
+                          className="rule-menu-item rule-menu-sub-trigger"
+                        >
+                          <span className={`menu-dot${s.strategy === "chain" ? " on" : ""}`} aria-hidden />
+                          {t("rules.targetChainShort")}
+                          <span className="rule-menu-caret" aria-hidden>›</span>
+                        </button>
+                        <div className="rule-menu-sub" role="menu">
+                          {chains.length === 0 ? (
+                            <span className="rule-menu-empty">{t("rules.noChains")}</span>
+                          ) : (
+                            chains.map((c) => (
+                              <button
+                                key={c.id}
+                                type="button"
+                                role="menuitem"
+                                className="rule-menu-item"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setMenuSetId(null);
+                                  void onQuickRoute(s, "chain", c.id);
+                                }}
+                              >
+                                <span
+                                  className={`menu-dot${s.strategy === "chain" && s.chain_id === c.id ? " on" : ""}`}
+                                  aria-hidden
+                                />
+                                {c.name}
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="rule-menu-item"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setMenuSetId(null);
+                          openEditSet(s);
+                        }}
+                      >
+                        {t("rules.menuMore")}
+                      </button>
+                    </div>
+                  </div>
                   <button
                     type="button"
                     role="menuitem"
@@ -1522,6 +1909,11 @@ export function RulesPage({ embedded = false }: Props) {
             <span className={`ruleset-strategy-label strategy-${s.strategy}`}>
               {strategyLabel(s.strategy)}
             </span>
+            {(s.node_ids?.length ?? 0) >= 2 && (
+              <span className="ruleset-builtin-label">
+                {t("rules.nodePoolCount", { n: s.node_ids!.length })}
+              </span>
+            )}
             {s.builtin && (
               <span className="ruleset-builtin-label">{t("rules.builtin")}</span>
             )}
@@ -1609,6 +2001,8 @@ export function RulesPage({ embedded = false }: Props) {
                   aria-label={t("rules.routeStrategyAria")}
                 >
                   {strategyLabel(viewSet?.strategy ?? "proxy")}
+                  {(viewSet?.node_ids?.length ?? 0) >= 2 &&
+                    ` · ${t("rules.nodePoolCount", { n: viewSet!.node_ids!.length })}`}
                 </span>
               </div>
               <div className="rules-toolbar-tail">
@@ -1875,15 +2269,23 @@ export function RulesPage({ embedded = false }: Props) {
                             aria-expanded={menuRuleId === r.id}
                             onClick={(e) => {
                               e.stopPropagation();
-                              setMenuRuleId((id) =>
-                                id === r.id ? null : r.id,
-                              );
+                              if (menuRuleId === r.id) {
+                                setMenuRuleId(null);
+                                return;
+                              }
+                              setMenuRowDown(rowMenuOpensDown(e.currentTarget));
+                              setMenuRuleId(r.id);
                             }}
                           >
                             ⋮
                           </button>
                           {menuRuleId === r.id && (
-                            <div className="rule-menu-pop" role="menu">
+                            <div
+                              className={`rule-menu-pop${
+                                menuRowDown ? " open-down" : ""
+                              }`}
+                              role="menu"
+                            >
                               <button
                                 type="button"
                                 role="menuitem"
@@ -1928,7 +2330,9 @@ export function RulesPage({ embedded = false }: Props) {
                 ×
               </button>
             </header>
-            <form className="modal-body" onSubmit={(e) => void onSave(e)}>
+            {/* Enter inserts a newline in the textarea; saving is click-only
+                (see doSave) so batch typing can never submit mid-entry. */}
+            <form className="modal-body" onSubmit={(e) => e.preventDefault()}>
               <div className="field">
                 <span>{t("rules.type")}</span>
                 <SolidSelect
@@ -1940,13 +2344,15 @@ export function RulesPage({ embedded = false }: Props) {
               </div>
               <label className="field">
                 <span>{t("rules.matchContent")}</span>
-                <input
+                <textarea
+                  className="payload-textarea"
                   autoCapitalize="off"
                   autoCorrect="off"
                   spellCheck={false}
                   value={payload}
                   onChange={(e) => setPayload(e.target.value)}
-                  placeholder="google.com / youtube / 10.0.0.0/8"
+                  placeholder={t("rules.payloadPlaceholder")}
+                  rows={3}
                   autoFocus
                 />
                 {payloadSuggestion && (
@@ -1954,12 +2360,43 @@ export function RulesPage({ embedded = false }: Props) {
                     variant="primary"
                     className="payload-suggestion-btn"
                     title={t("rules.clickToReplace")}
-                    onClick={() => setPayload(payloadSuggestion)}
+                    onClick={() =>
+                      setPayload(
+                        payloadEntries
+                          .map((entry, i) =>
+                            i === payloadSuggestion.index ? payloadSuggestion.value : entry,
+                          )
+                          .join("\n"),
+                      )
+                    }
                   >
                     {t("rules.urlDetectedHint")}{" "}
-                    <span className="mono">{payloadSuggestion}</span>
+                    <span className="mono">{payloadSuggestion.value}</span>
                   </GlassButton>
                 )}
+                {payloadIssues.length > 0 ? (
+                  <div className="payload-issues" role="alert">
+                    {payloadIssues.slice(0, 3).map((issue) => (
+                      <div key={issue.index} className="mono">
+                        {issue.kind === "domain"
+                          ? t("rules.payloadInvalidDomain", { i: issue.index + 1, v: issue.value })
+                          : issue.kind === "ip"
+                            ? t("rules.payloadInvalidIp", { i: issue.index + 1, v: issue.value })
+                            : t("rules.payloadInvalidProcess", { i: issue.index + 1, v: issue.value })}
+                      </div>
+                    ))}
+                    {payloadIssues.length > 3 &&
+                      t("rules.payloadMoreIssues", { n: payloadIssues.length - 3 })}
+                  </div>
+                ) : payloadEditMulti ? (
+                  <div className="payload-issues" role="alert">
+                    {t("rules.payloadEditSingle")}
+                  </div>
+                ) : payloadEntries.length > 1 ? (
+                  <div className="payload-count">
+                    {t("rules.payloadBatchCount", { n: payloadEntries.length })}
+                  </div>
+                ) : null}
               </label>
               <div className="field">
                 <span>{t("rules.outbound")}</span>
@@ -2146,18 +2583,25 @@ export function RulesPage({ embedded = false }: Props) {
                   {t("common.cancel")}
                 </GlassButton>
                 <GlassButton
-                  type="submit"
+                  type="button"
                   variant="primary"
                   disabled={
                     busy ||
                     plainDiverged ||
                     !payload.trim() ||
+                    payloadIssues.length > 0 ||
+                    payloadEditMulti ||
                     (viewSet?.strategy === "smart" && target === "node" && !pinNodeId.trim()) ||
                     (viewSet?.strategy === "smart" && target === "smart" &&
                       (nodes.length === 0 || smartKeywordOverlap.length > 0))
                   }
+                  onClick={() => void doSave()}
                 >
-                  {busy ? t("common.saving") : t("common.save")}
+                  {busy
+                    ? t("common.saving")
+                    : !editRule && payloadEntries.length > 1
+                      ? t("rules.payloadSaveCount", { n: payloadEntries.length })
+                      : t("common.save")}
                 </GlassButton>
               </footer>
             </form>
@@ -2244,7 +2688,12 @@ export function RulesPage({ embedded = false }: Props) {
               </label>
               {newSetTarget === "node" && (
                 <div className="field rule-node-pick">
-                  <span>{t("rules.pickNode")}</span>
+                  <div className="batch-route-label-row">
+                    <span>{t("rules.pickNode")}</span>
+                    <span className="field-hint muted" style={{ margin: 0 }}>
+                      {t("rules.pickedCount", { n: newSetNodeIds.length })}
+                    </span>
+                  </div>
                   {nodes.length === 0 ? (
                     <p className="muted" style={{ margin: 0, fontSize: 12 }}>
                       {t("rules.noNodes")}
@@ -2260,23 +2709,37 @@ export function RulesPage({ embedded = false }: Props) {
                         onChange={(e) => setNewSetNodeQuery(e.target.value)}
                         placeholder={t("rules.pickNodePh")}
                       />
-                      <SolidSelect
-                        list
-                        listSize={Math.min(
-                          8,
-                          Math.max(4, newSetFilteredNodes.length || 4),
-                        )}
-                        value={newSetNodeId}
-                        onChange={setNewSetNodeId}
+                      <div
+                        className="solid-select solid-select-list node-multi-list"
+                        role="listbox"
                         aria-label={t("rules.pickNode")}
-                        options={[
-                          { value: "", label: t("rules.needNode") },
-                          ...newSetFilteredNodes.map((n) => ({
-                            value: n.id,
-                            label: n.name,
-                          })),
-                        ]}
-                      />
+                        aria-multiselectable="true"
+                      >
+                        {newSetPickerNodes.map((n) => {
+                          const picked = newSetNodeIds.includes(n.id);
+                          return (
+                            <button
+                              key={n.id}
+                              type="button"
+                              role="option"
+                              aria-selected={picked}
+                              className={`solid-select-option node-multi-option${picked ? " active" : ""}`}
+                              {...nodeTip(n, t)}
+                              onClick={() =>
+                                setNewSetNodeIds(toggleInList(newSetNodeIds, n.id))
+                              }
+                            >
+                              <span className="node-multi-check" aria-hidden />
+                              <span className="node-multi-name">{n.name}</span>
+                            </button>
+                          );
+                        })}
+                        {newSetPickerNodes.length === 0 && (
+                          <p className="muted" style={{ margin: 0, fontSize: 12, padding: "0.45rem 0.6rem" }}>
+                            {t("rules.nodePickEmpty")}
+                          </p>
+                        )}
+                      </div>
                     </>
                   )}
                 </div>
@@ -2416,7 +2879,7 @@ export function RulesPage({ embedded = false }: Props) {
                     !newSetName.trim() ||
                     (newSetKind === "remote" && !newSetUrl.trim()) ||
                     (newSetTarget === "node" &&
-                      (nodes.length === 0 || !newSetNodeId.trim())) ||
+                      (nodes.length === 0 || newSetNodeIds.length === 0)) ||
                     newSetKeywordOverlap.length > 0
                   }
                 >
@@ -2432,15 +2895,7 @@ export function RulesPage({ embedded = false }: Props) {
         <div
           className="modal-backdrop"
         >
-          <div
-            className={`modal rules-form-modal edit-set-modal${
-              editSetRouteTarget === "node" ||
-              editSetRouteTarget === "smart" ||
-              editSetRouteTarget === "chain"
-                ? " has-detail"
-                : ""
-            }`}
-          >
+          <div className="modal rules-form-modal edit-set-modal">
             <header className="modal-header">
               <h2>{t("rules.editSetTitle")}</h2>
               <button
@@ -2453,9 +2908,8 @@ export function RulesPage({ embedded = false }: Props) {
               </button>
             </header>
             <form className="modal-body" onSubmit={(e) => void onEditSet(e)}>
-              <div className="edit-set-body">
-              <div className="edit-set-col-left">
-                <label className="field">
+              <div className="edit-set-field-row">
+                <label className="field edit-set-field-main">
                   <span>{t("rules.setName")}</span>
                   <input
                     autoCapitalize="off"
@@ -2467,47 +2921,8 @@ export function RulesPage({ embedded = false }: Props) {
                     maxLength={64}
                   />
                 </label>
-                {editSetTarget.remote && (
-                  <>
-                    <label className="field">
-                      <span>{t("rules.addModeRemote")}</span>
-                      <input
-                        autoCapitalize="off"
-                        autoCorrect="off"
-                        spellCheck={false}
-                        value={editSetUrl}
-                        onChange={(e) => setEditSetUrl(e.target.value)}
-                        placeholder="https://example.com/rules.json"
-                        disabled={editSetTarget.resettable}
-                      />
-                      {editSetTarget.resettable && (
-                        <span className="field-hint muted">
-                          {t("rules.systemUrlLocked")}
-                        </span>
-                      )}
-                    </label>
-                    <label className="field">
-                      <span>{t("rules.autoUpdate")}</span>
-                      <GlassSeg
-                        value={editSetUpdateInterval}
-                        ariaLabel={t("rules.autoUpdate")}
-                        onChange={(value) =>
-                          setEditSetUpdateInterval(
-                            value as "disabled" | "1h" | "12h" | "24h",
-                          )
-                        }
-                        options={[
-                          { value: "disabled", label: t("rules.autoUpdateDisabled") },
-                          { value: "1h", label: t("rules.autoUpdate1h") },
-                          { value: "12h", label: t("rules.autoUpdate12h") },
-                          { value: "24h", label: t("rules.autoUpdate24h") },
-                        ]}
-                      />
-                    </label>
-                  </>
-                )}
                 {editSetTarget.strategy !== "block" && (
-                  <label className="field">
+                  <label className="field edit-set-field-side">
                     <span>{t("rules.setMenuDnsTitle")}</span>
                     <GlassSeg
                       value={editSetDnsStrategy}
@@ -2521,143 +2936,177 @@ export function RulesPage({ embedded = false }: Props) {
                         { value: "remote", label: dnsStrategyLabel("remote") },
                       ]}
                     />
-                    <span className="field-hint muted">
-                      {t("rules.currentDnsHint", { current: dnsStrategyLabel(editSetDnsStrategy) })}
-                    </span>
                   </label>
                 )}
-                <div className="edit-set-info">
-                  <div className="edit-set-info-row">
-                    <span className="muted">{t("rules.rulesCount", { n: editSetTarget.rule_count })}</span>
-                    <span className="muted">
-                      {editSetTarget.builtin
-                        ? t("rules.builtin")
-                        : editSetTarget.remote
-                          ? t("rules.originRemote")
-                          : t("rules.originLocal")}
-                    </span>
-                  </div>
-                  {editSetTarget.remote && (
-                    <div className="edit-set-info-row">
-                      <span className="muted">{t("rules.lastUpdated")}</span>
-                      <span className="muted">{fmtDatTime(editSetTarget.remote.last_update ?? null)}</span>
-                    </div>
-                  )}
-                  {editSetRulePreview.length > 0 && (
-                    <div className="edit-set-rule-preview">
-                      <span className="muted">{t("rules.rulePreviewLabel")}</span>
-                      <ul>
-                        {editSetRulePreview.map((rule) => (
-                          <li key={rule.id} title={rule.payload}>
-                            <span className="edit-set-rule-preview-type">
-                              {ruleTypeLabel(rule.type)}
-                            </span>
-                            <span className="edit-set-rule-preview-payload">
-                              {rule.payload}
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
-                      {editSetTarget.rule_count > editSetRulePreview.length && (
-                        <span className="muted">
-                          {t("rules.rulePreviewMore", {
-                            n: editSetTarget.rule_count - editSetRulePreview.length,
-                          })}
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
               </div>
-              <div className="edit-set-col-right">
-                <div className="field">
-                  <div className="batch-route-label-row">
-                    <span>{t("rules.batchRouteLabel")}</span>
-                    {!editSetRouteUnchanged(editSetTarget) && (
-                      <span className="field-hint-warn" style={{ margin: 0 }}>
-                        {t("rules.batchOverwriteHint")}
+              {editSetTarget.remote && (
+                <div className="edit-set-field-row">
+                  <label className="field edit-set-field-main">
+                    <span>{t("rules.addModeRemote")}</span>
+                    <input
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      value={editSetUrl}
+                      onChange={(e) => setEditSetUrl(e.target.value)}
+                      placeholder="https://example.com/rules.json"
+                      disabled={editSetTarget.resettable}
+                    />
+                    {editSetTarget.resettable && (
+                      <span className="field-hint muted">
+                        {t("rules.systemUrlLocked")}
                       </span>
                     )}
-                  </div>
-                  <GlassSeg
-                    value={editSetRouteTarget}
-                    ariaLabel={t("rules.batchRouteLabel")}
-                    onChange={(value) => setEditSetRouteTarget(value as RuleTarget | "mixed")}
-                    options={[
-                      { value: "mixed", label: t("rules.strategySmart") },
-                      { value: "proxy", label: t("rules.targetProxy") },
-                      { value: "direct", label: t("rules.targetDirect") },
-                      { value: "block", label: t("rules.targetBlock") },
-                      { value: "node", label: t("rules.strategyNode") },
-                      { value: "smart", label: t("rules.strategyFilter") },
-                      { value: "chain", label: t("rules.targetChainShort") },
-                    ]}
-                  />
-                  <span className="field-hint muted">
-                    {t("rules.currentRouteHint", { current: strategyLabel(editSetTarget.strategy) })}
-                  </span>
+                  </label>
+                  <label className="field edit-set-field-side">
+                    <span>{t("rules.autoUpdate")}</span>
+                    <GlassSeg
+                      value={editSetUpdateInterval}
+                      ariaLabel={t("rules.autoUpdate")}
+                      onChange={(value) =>
+                        setEditSetUpdateInterval(
+                          value as "disabled" | "1h" | "12h" | "24h",
+                        )
+                      }
+                      options={[
+                        { value: "disabled", label: t("rules.autoUpdateDisabled") },
+                        { value: "1h", label: t("rules.autoUpdate1h") },
+                        { value: "12h", label: t("rules.autoUpdate12h") },
+                        { value: "24h", label: t("rules.autoUpdate24h") },
+                      ]}
+                    />
+                  </label>
                 </div>
-                {!editSetRouteUnchanged(editSetTarget) && (
-                  <p className="banner error" style={{ margin: 0, fontSize: 12 }}>
-                    {editSetTarget.remote
-                      ? t("rules.batchRemoteHint", { name: editSetTarget.name })
-                      : t("rules.batchHint", {
-                          name: editSetTarget.name,
-                          n: editSetTarget.rule_count,
-                        })}
-                  </p>
+              )}
+              <div className="edit-set-route-block">
+                <div className="batch-route-label-row">
+                  <span>{t("rules.batchRouteLabel")}</span>
+                </div>
+                <GlassSeg
+                  value={editSetRouteTarget}
+                  ariaLabel={t("rules.batchRouteLabel")}
+                  onChange={(value) => setEditSetRouteTarget(value as RuleTarget | "mixed")}
+                  options={[
+                    { value: "mixed", label: t("rules.strategySmart") },
+                    { value: "proxy", label: t("rules.targetProxy") },
+                    { value: "direct", label: t("rules.targetDirect") },
+                    { value: "block", label: t("rules.targetBlock") },
+                    { value: "node", label: t("rules.strategyNode") },
+                    { value: "smart", label: t("rules.strategyFilter") },
+                    { value: "chain", label: t("rules.targetChainShort") },
+                  ]}
+                />
+                {/* One constant-height line below the picker: set meta when the
+                    pick matches the current route, the overwrite warning in
+                    red once it deviates — same slot, so nothing below moves. */}
+                <p className="edit-set-status-line">
+                  {editSetRouteUnchanged(editSetTarget) ? (
+                    <span className="muted">
+                      {[
+                        t("rules.currentRouteHint", { current: strategyLabel(editSetTarget.strategy) }),
+                        t("rules.rulesCount", { n: editSetTarget.rule_count }),
+                        editSetTarget.builtin
+                          ? t("rules.builtin")
+                          : editSetTarget.remote
+                            ? t("rules.originRemote")
+                            : t("rules.originLocal"),
+                        editSetTarget.remote
+                          ? `${t("rules.lastUpdated")} ${fmtDatTime(editSetTarget.remote.last_update ?? null)}`
+                          : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  ) : (
+                    <span className="edit-set-status-warn">
+                      {editSetTarget.remote
+                        ? `${t("rules.batchRemoteHint", { name: editSetTarget.name })} ${strategyLabel(editSetRouteTarget)}`
+                        : `${t("rules.batchHint", {
+                            name: editSetTarget.name,
+                            n: editSetTarget.rule_count,
+                          })} ${strategyLabel(editSetRouteTarget)}`}
+                    </span>
+                  )}
+                </p>
+              </div>
+              <div className="route-target-params">
+                {editSetRouteTarget === "mixed" && (
+                  <p className="route-target-params-empty">{t("rules.mixedSetHint")}</p>
                 )}
-                <div className="route-target-params">
-                  {editSetRouteTarget === "mixed" && (
-                    <p className="route-target-params-empty">{t("rules.mixedSetHint")}</p>
-                  )}
-                  {editSetRouteTarget === "proxy" && (
-                    <p className="route-target-params-empty">{t("rules.targetProxyDesc")}</p>
-                  )}
-                  {editSetRouteTarget === "direct" && (
-                    <p className="route-target-params-empty">{t("rules.targetDirectDesc")}</p>
-                  )}
-                  {editSetRouteTarget === "block" && (
-                    <p className="route-target-params-empty">{t("rules.targetBlockDesc")}</p>
-                  )}
-                  {editSetRouteTarget === "node" && (
-                    <div className="field rule-node-pick">
+                {editSetRouteTarget === "proxy" && (
+                  <p className="route-target-params-empty">{t("rules.targetProxyDesc")}</p>
+                )}
+                {editSetRouteTarget === "direct" && (
+                  <p className="route-target-params-empty">{t("rules.targetDirectDesc")}</p>
+                )}
+                {editSetRouteTarget === "block" && (
+                  <p className="route-target-params-empty">{t("rules.targetBlockDesc")}</p>
+                )}
+                {editSetRouteTarget === "node" && (
+                  <div className="field rule-node-pick">
+                    <div className="batch-route-label-row">
                       <span>{t("rules.pickNode")}</span>
-                      {nodes.length === 0 ? (
-                        <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-                          {t("rules.noNodes")}
-                        </p>
-                      ) : (
-                        <>
-                          <input
-                            autoCapitalize="off"
-                            autoCorrect="off"
-                            spellCheck={false}
-                            className="search"
-                            value={editSetNodeQuery}
-                            onChange={(e) => setEditSetNodeQuery(e.target.value)}
-                            placeholder={t("rules.pickNodePh")}
-                          />
-                          <SolidSelect
-                            list
-                            value={editSetNodeId}
-                            onChange={setEditSetNodeId}
-                            aria-label={t("rules.pickNode")}
-                            options={[
-                              { value: "", label: t("rules.needNode") },
-                              ...editSetFilteredNodes.map((n) => ({
-                                value: n.id,
-                                label: n.name,
-                              })),
-                            ]}
-                          />
-                        </>
-                      )}
+                      <span className="field-hint muted" style={{ margin: 0 }}>
+                        {t("rules.pickedCount", { n: editSetNodeIds.length })}
+                      </span>
                     </div>
-                  )}
-                  {editSetRouteTarget === "smart" && (
-                    <div className="field rule-smart-filters">
-                      <label className="field" style={{ marginBottom: 8 }}>
+                    {nodes.length === 0 ? (
+                      <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+                        {t("rules.noNodes")}
+                      </p>
+                    ) : (
+                      <>
+                        <input
+                          autoCapitalize="off"
+                          autoCorrect="off"
+                          spellCheck={false}
+                          className="search"
+                          value={editSetNodeQuery}
+                          onChange={(e) => setEditSetNodeQuery(e.target.value)}
+                          placeholder={t("rules.pickNodePh")}
+                        />
+                        {/* Multi-pick: 1 selection = classic single pin,
+                            2+ = whole-set explicit pool. Picked rows pin to
+                            the top with a leading checkbox. */}
+                        <div
+                          className="solid-select solid-select-list node-multi-list"
+                          role="listbox"
+                          aria-label={t("rules.pickNode")}
+                          aria-multiselectable="true"
+                        >
+                          {editSetPickerNodes.map((n) => {
+                            const picked = editSetNodeIds.includes(n.id);
+                            return (
+                              <button
+                                key={n.id}
+                                type="button"
+                                role="option"
+                                aria-selected={picked}
+                                className={`solid-select-option node-multi-option${picked ? " active" : ""}`}
+                                {...nodeTip(n, t)}
+                                onClick={() =>
+                                  setEditSetNodeIds(toggleInList(editSetNodeIds, n.id))
+                                }
+                              >
+                                <span className="node-multi-check" aria-hidden />
+                                <span className="node-multi-name">{n.name}</span>
+                              </button>
+                            );
+                          })}
+                          {editSetPickerNodes.length === 0 && (
+                            <p className="muted" style={{ margin: 0, fontSize: 12, padding: "0.45rem 0.6rem" }}>
+                              {t("rules.nodePickEmpty")}
+                            </p>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+                {editSetRouteTarget === "smart" && (
+                  <div className="field rule-smart-filters">
+                    <div className="edit-set-smart-row">
+                      <label className="field">
                         <span>{t("rules.smartInclude")}</span>
                         <input
                           autoCapitalize="off"
@@ -2668,7 +3117,7 @@ export function RulesPage({ embedded = false }: Props) {
                           placeholder={t("rules.smartIncludePh")}
                         />
                       </label>
-                      <label className="field" style={{ marginBottom: 8 }}>
+                      <label className="field">
                         <span>{t("rules.smartExclude")}</span>
                         <input
                           autoCapitalize="off"
@@ -2679,66 +3128,88 @@ export function RulesPage({ embedded = false }: Props) {
                           placeholder={t("rules.smartExcludePh")}
                         />
                       </label>
-                      {editSetKeywordOverlap.length > 0 ? (
-                        <p className="banner error" style={{ margin: 0, fontSize: 12 }}>
-                          {t("rules.smartKeywordConflict", {
-                            k: editSetKeywordOverlap.join("、"),
-                          })}
-                        </p>
-                      ) : (
-                        <p
-                          className="muted"
-                          style={{
-                            margin: 0,
-                            fontSize: 12,
-                            color:
-                              editSetSmartMatchCount === 0
-                                ? "var(--danger, #e55)"
-                                : undefined,
-                          }}
-                        >
-                          {t("rules.smartMatchCount", { n: editSetSmartMatchCount })}
-                        </p>
-                      )}
                     </div>
-                  )}
-                  {editSetRouteTarget === "chain" && (
-                    <div className="field rule-chain-pick">
-                      <span>{t("rules.pickChain")}</span>
-                      {chains.length === 0 ? (
-                        <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-                          {t("rules.noChains")}
-                        </p>
-                      ) : (
-                        <>
-                          <input
-                            autoCapitalize="off"
-                            autoCorrect="off"
-                            spellCheck={false}
-                            className="search"
-                            value={editSetChainQuery}
-                            onChange={(e) => setEditSetChainQuery(e.target.value)}
-                            placeholder={t("rules.pickChainPh")}
-                          />
-                          <SolidSelect
-                            list
-                            value={editSetChainId}
-                            onChange={setEditSetChainId}
-                            aria-label={t("rules.pickChain")}
-                            options={[
-                              { value: "", label: t("rules.needChain") },
-                              ...editSetFilteredChains.map((c) => ({
-                                value: c.id,
-                                label: c.name,
-                              })),
-                            ]}
-                          />
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
+                    {editSetKeywordOverlap.length > 0 ? (
+                      <p className="banner error" style={{ margin: 0, fontSize: 12 }}>
+                        {t("rules.smartKeywordConflict", {
+                          k: editSetKeywordOverlap.join("、"),
+                        })}
+                      </p>
+                    ) : (
+                      <p
+                        className="muted"
+                        style={{
+                          margin: 0,
+                          fontSize: 12,
+                          color:
+                            editSetSmartMatchCount === 0
+                              ? "var(--danger, #e55)"
+                              : undefined,
+                        }}
+                      >
+                        {t("rules.smartMatchCount", { n: editSetSmartMatchCount })}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {editSetRouteTarget === "chain" && (
+                  <div className="field rule-chain-pick">
+                    <span>{t("rules.pickChain")}</span>
+                    {chains.length === 0 ? (
+                      <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+                        {t("rules.noChains")}
+                      </p>
+                    ) : (
+                      <>
+                        <input
+                          autoCapitalize="off"
+                          autoCorrect="off"
+                          spellCheck={false}
+                          className="search"
+                          value={editSetChainQuery}
+                          onChange={(e) => setEditSetChainQuery(e.target.value)}
+                          placeholder={t("rules.pickChainPh")}
+                        />
+                        <SolidSelect
+                          list
+                          value={editSetChainId}
+                          onChange={setEditSetChainId}
+                          aria-label={t("rules.pickChain")}
+                          options={[
+                            { value: "", label: t("rules.needChain") },
+                            ...editSetFilteredChains.map((c) => ({
+                              value: c.id,
+                              label: c.name,
+                            })),
+                          ]}
+                        />
+                      </>
+                    )}
+                    {chains.length > 0 && (
+                      <div className="edit-set-chain-hops">
+                        <span className="muted">{t("rules.chainHopsLabel")}</span>
+                        {editSetChainHopLabels && editSetChainHopLabels.length > 0 ? (
+                          <div className="edit-set-chain-hops-flow">
+                            {editSetChainHopLabels.map((label, i) => (
+                              <Fragment key={`${label}-${i}`}>
+                                {i > 0 && (
+                                  <span className="edit-set-chain-hop-arrow" aria-hidden>
+                                    →
+                                  </span>
+                                )}
+                                <span className="edit-set-chain-hop-chip">{label}</span>
+                              </Fragment>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="muted edit-set-chain-hops-empty">
+                            {t("rules.chainHopsEmpty")}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <footer className="modal-footer">
@@ -2750,9 +3221,10 @@ export function RulesPage({ embedded = false }: Props) {
                   variant="primary"
                   disabled={
                     editSetBusy ||
+                    !editSetHasChanges() ||
                     !editSetName.trim() ||
                     (!!editSetTarget.remote && !editSetUrl.trim()) ||
-                    (editSetRouteTarget === "node" && !editSetNodeId.trim()) ||
+                    (editSetRouteTarget === "node" && editSetNodeIds.length === 0) ||
                     (editSetRouteTarget === "chain" && !editSetChainId.trim()) ||
                     editSetKeywordOverlap.length > 0
                   }

@@ -190,6 +190,9 @@ export interface ImportResult {
   subscription: SubscriptionView;
   node_count: number;
   skipped_count: number;
+  /** Skipped-node details (name + reason), present when any node was
+   *  dropped during import/refresh. */
+  skipped?: { name?: string | null; reason: string }[];
 }
 
 /** shadow-tls SIP003 plugin params carried alongside a shadowsocks node. */
@@ -286,6 +289,17 @@ export type ProtocolConfig =
       obfs_mode?: string;
       obfs_host?: string;
       mode?: string;
+    }
+  | {
+      /** MASQUE (RFC 9484) — mihomo-only, usque-generated ECDSA keys. */
+      protocol: "masque";
+      private_key: string;
+      public_key: string;
+      ip?: string;
+      ipv6?: string;
+      mtu?: number;
+      network?: string;
+      congestion_controller?: string;
     };
 
 /** TLS layer — mirrors Rust `TlsConfig`. REALITY fields only carry values on
@@ -313,7 +327,7 @@ export type TransportDetail =
   | { type: "grpc"; service_name?: string }
   | { type: "http"; path?: string; host?: string[] }
   | { type: "httpupgrade"; path?: string; host?: string }
-  | { type: "xhttp"; path?: string; host?: string; mode?: string };
+  | { type: "xhttp"; path?: string; host?: string; mode?: string; extra?: string };
 
 export interface ProxyNode {
   id: string;
@@ -426,6 +440,11 @@ export interface ManualNodeDraft {
   host?: string | null;
   serviceName?: string | null;
   udp?: boolean | null;
+  publicKey?: string | null;
+  /** MASQUE local IPv4 (CIDR). */
+  ip?: string | null;
+  /** MASQUE local IPv6 (CIDR). */
+  ipv6?: string | null;
 }
 
 /** Clash-style routing mode. */
@@ -526,7 +545,7 @@ export interface AppSettings {
 export interface ProtocolCoreItem {
   /** `Protocol::as_str` value, e.g. "vless". */
   protocol: string;
-  /** `CoreKind` the protocol is pinned to (v1: "xray"). */
+  /** Sidecar `CoreKind` the protocol is pinned to: "xray" | "mihomo". */
   core: string;
 }
 
@@ -568,8 +587,6 @@ export interface CoreInfo {
   /** Pinned factory version (backend `fallback_version`); restore target
    *  for cores with no bundled copy — re-downloads this exact tag. */
   factory_version?: string | null;
-  /** Unix seconds, from the installed binary's mtime — "last installed". */
-  installed_at?: number | null;
 }
 
 export interface CoreDownloadResult {
@@ -649,8 +666,11 @@ export interface ProxyStatus {
   /** True when the running core has elevated privileges (macOS: setuid-root;
    *  Windows: UAC). */
   core_elevated?: boolean;
-  /** Companion Xray sidecar process is running (sing-box main mode). */
+  /** Companion sidecar process is running (sing-box main mode). Never true
+   * under other cores. */
   sidecar_running?: boolean;
+  /** Alive sidecar core kinds (e.g. ["xray","mihomo"]); empty when none. */
+  sidecar_kinds?: string[];
 }
 
 export type RuleType =
@@ -673,6 +693,8 @@ export interface RuleSetSummary {
   /** Set-level route parameters (strategy === "node" | "filter" | "chain"). */
   node_id?: string | null;
   node_name?: string | null;
+  /** Explicit multi-node pool members (strategy === "node", 2+ picks). */
+  node_ids?: string[];
   smart_include?: string[];
   smart_exclude?: string[];
   /** When strategy is `chain`: whole-set chain id. */

@@ -296,6 +296,13 @@ impl CoreKind {
                     return false;
                 }
             }
+            // Xray v26 removed the h2/http transport at config load — such
+            // nodes can only be served by sing-box/mihomo (the generator
+            // rejects them with the same rule; the list filter keeps them
+            // hidden under Xray like any other unsupported shape).
+            if matches!(node.transport, Some(crate::domain::Transport::Http { .. })) {
+                return false;
+            }
         }
         if matches!(
             &node.config,
@@ -459,11 +466,17 @@ mod tests {
         assert!(CoreKind::Xray.supports(Protocol::WireGuard));
         assert!(CoreKind::Xray.supports(Protocol::Hysteria2));
         assert!(!CoreKind::Xray.supports(Protocol::Tuic));
+        assert!(!CoreKind::Xray.supports(Protocol::Masque));
         assert!(CoreKind::SingBox.supports(Protocol::Hysteria2));
+        // SingBox "supports" everything at listing level by design — masque
+        // nodes stay visible under the sing-box main core so users can pin
+        // them to a sidecar; generation filters what it can't emit.
+        assert!(CoreKind::SingBox.supports(Protocol::Masque));
         // mihomo: canonical Clash Meta — near-full coverage.
         assert!(CoreKind::Mihomo.supports(Protocol::Hysteria2));
         assert!(CoreKind::Mihomo.supports(Protocol::AnyTls));
         assert!(CoreKind::Mihomo.supports(Protocol::Snell));
+        assert!(CoreKind::Mihomo.supports(Protocol::Masque));
         assert!(CoreKind::Mihomo.supports(Protocol::Tuic));
         assert!(CoreKind::Mihomo.supports(Protocol::WireGuard));
         assert!(CoreKind::Mihomo.supports(Protocol::Hysteria));
