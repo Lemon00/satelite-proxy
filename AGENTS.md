@@ -332,7 +332,7 @@ React UI ──invoke()──▶ commands/* ──▶ AppState ──▶ storage
 | `ConnectionsPage` (215) | 1.5s revision-delta 增量轮询（`list_connection_changes` + `applyConnectionChanges`） |
 | `RequestsPage` (258) / `FailuresPage` (510) | 已关闭请求/失败请求日志；Failures 可一键生成封锁规则集 |
 | `LogsPage` (~380) | 四 tab：应用日志（1.2s 增量，级别过滤+搜索）/ sing-box / Xray / mihomo 内核日志（tab 带运行绿灯，原始 stdout，1.2s 轮询 `get_core_log_tail(kind)`；多核下主核/副进程各写各的 `logs/<prefix>-<hour>.log`，按 kind 读取，见 `Runtime::core_log_tail_for`）；头部 自动滚动/刷新/清空 与级别过滤、搜索框对所有 tab 统一（清空=app 清库 / kernel 截断当前小时文件 `clear_core_log`） |
-| `SettingsPage` (1456) | 8 tab：app/ports/rules/chain/multiCore/dns/hosts/core；内嵌 Rules/Chain/多核模式/Dns/Hosts 页；三内核行（各自版本/下载/更新，进度事件按 kind 分流）、多核模式 tab（启停开关 + 协议→内核 table，§9.20；按协议支持面各选 Xray/mihomo——如 hy2 两者皆可，masque 仅 mihomo 且「auto」显示「未启用」而非「跟随主内核」，因 sing-box 无原生出路）、更新检查、诊断、托盘图标选择、赞助二维码（`DecryptReveal`） |
+| `SettingsPage` (1456) | 8 tab：app/ports/rules/chain/multiCore/dns/hosts/core；内嵌 Rules/Chain/多核模式/Dns/Hosts 页；三内核行（各自版本/下载/更新，进度事件按 kind 分流）、多核模式 tab（启停开关 + 协议→内核 table，§9.20；按协议支持面各选 Xray/mihomo——如 hy2 两者皆可，masque 仅 mihomo 且「auto」显示「未启用」而非「跟随主内核」，因 sing-box 无原生出路）、更新检查、诊断、托盘图标选择 |
 | `RulesPage` (2145) | ★ 最大页面：规则集侧栏+编辑器、本地/远程集、策略/DNS 策略、route.final、拖拽排序、远程规则项浏览；geodata 内核（Xray/mihomo）下内置 3 条显示为 geodata 卡（来源/文件按内核区分，更新走 `refresh_geodata(kind)`），自建 .srs 置灰；策略可指向 chain（`chain_id`） |
 | `ChainPage` (~1700) | 高密度管理列表，内嵌于 Settings：节点池=单容器紧凑行（名称+关键字+模式pill+计数+引用，行尾 `RowMenu` ⋮ 菜单，复用 rule-menu 范式），链卡=头行徽标（跳数/规则引用/⋮）+ 地铁线 stepper；链路编辑器为 xyflow（`@xyflow/react`）画布：侧栏候选拖入/点击追加（WKWebView 无 HTML5 DnD，用指针事件自实现）、`hopsFromGraph` 单线路径校验（连线时 `isValidConnection` 即时拦截分支/环/自环）、图序号徽标 + 实时有效性状态行、整理布局按钮；fitView 仅在打开已有链路且节点完成测量后执行一次（`useNodesInitialized`），否则画布会因未测量节点算出坏视口而看似空白、或投放后视口跳走 |
 | `DnsPage` (~640) / `HostsPage` (463) | DNS/Hosts 管理，通常内嵌于 Settings；通用卡（劫持/兜底/缓存/FakeIP/远程加密 DNS——FakeIP 仅启用开关+⋯ 弹窗编辑池/IPv6/bypass，远程加密 DNS ⋯ 弹窗按行编辑 DoH 池，空=内置 1.1.1.1/8.8.8.8，见 §18①）；诊断 = 规则列表风格表格（域名|策略|匹配|DNS 服务器|内核解析，一行一域名，`diagnoseDns` 支持全部诊断与行内单个诊断，自定义域名 localStorage 持久化 `satelite.dnsDiagDomains`，本地/国内路径标红 ⚠ 泄露风险，见 `services/dns_diag.rs`） |
@@ -345,7 +345,7 @@ React UI ──invoke()──▶ commands/* ──▶ AppState ──▶ storage
 
 - 设计系统：`GlassButton`、`GlassSeg`（区分用户点击与状态重绘才做动画）、`GlassSwitch(+Control)`、`SolidSelect`（**自绘下拉：macOS WKWebView 原生 select 无法主题化**，SolidSelect.tsx:26 注释）。
 - 首页视觉：`HeroVisual`（按 `heroStyle` 分发）→ `ParticleSphere`（three.js，lazy）/ `FaceMark`（Canvas2D 笑脸）/ 经典轨道。
-- 弹窗：`AddConfigModal`（url/file/paste/手动节点/sing-box 五种来源）、`EditLocalNodesModal`、`NodeDraftFields`（16 协议条件字段表单，与 `ManualNodeDraft` 对应）、`NodeDetailModal`（节点卡片 ⋮ 菜单「详情」只读弹窗：按协议渲染协议参数/TLS/传输层；数据来自 `list_all_nodes` 载荷里 serde-flatten 的完整 `ProxyNode`（`config/tls/transport`），前端 `types.ts` 已镜像为 `ProtocolConfig` tagged union，**纯前端无后端命令**）、`AccentColorPickerModal`（自定义主题色取色器；`theme/accents.ts` 支持 `#rrggbb` 自定义 accent，Rust `update_settings` 同步放行）、`DecryptReveal`。
+- 弹窗：`AddConfigModal`（url/file/paste/手动节点/sing-box 五种来源）、`EditLocalNodesModal`、`NodeDraftFields`（16 协议条件字段表单，与 `ManualNodeDraft` 对应）、`NodeDetailModal`（节点卡片 ⋮ 菜单「详情」只读弹窗：按协议渲染协议参数/TLS/传输层；数据来自 `list_all_nodes` 载荷里 serde-flatten 的完整 `ProxyNode`（`config/tls/transport`），前端 `types.ts` 已镜像为 `ProtocolConfig` tagged union，**纯前端无后端命令**）、`AccentColorPickerModal`（自定义主题色取色器；`theme/accents.ts` 支持 `#rrggbb` 自定义 accent，Rust `update_settings` 同步放行）。
 - hooks：
   - `useVisibleInterval` — **通用轮询原语**：页面隐藏暂停、回调不重叠、可见即重发；
   - `useVirtualRange` — 基于 `.main` 滚动容器的列表虚拟化（支持网格 itemsPerRow）；
