@@ -314,6 +314,31 @@ impl CoreKind {
         {
             return false;
         }
+        // Xray dropped every non-AEAD shadowsocks stream cipher (aes-*-cfb,
+        // rc4-md5, ...) at config load — only AEAD and SS2022 methods remain.
+        // mihomo still serves the legacy ciphers, so fall back there instead
+        // of generating a config Xray refuses to start.
+        if self == Self::Xray {
+            if let crate::domain::ProtocolConfig::Shadowsocks { method, .. } = &node.config {
+                let method = method.to_ascii_lowercase();
+                let aead_or_2022 = method.starts_with("2022-blake3-")
+                    || matches!(
+                        method.as_str(),
+                        "aes-128-gcm"
+                            | "aes-256-gcm"
+                            | "chacha20-poly1305"
+                            | "chacha20-ietf-poly1305"
+                            | "aead_aes_128_gcm"
+                            | "aead_aes_256_gcm"
+                            | "aead_chacha20_poly1305"
+                            | "none"
+                            | "plain"
+                    );
+                if !aead_or_2022 {
+                    return false;
+                }
+            }
+        }
         if matches!(self, Self::Mihomo)
             && matches!(node.transport, Some(crate::domain::Transport::Xhttp { .. }))
         {
@@ -622,6 +647,33 @@ mod tests {
             *obfs = None;
         }
         assert!(CoreKind::Xray.supports_node(&hy2_obfs));
+        // Xray removed every non-AEAD shadowsocks stream cipher at config
+        // load (github.com/XTLS/Xray-core/issues/1890): a node stuck on
+        // aes-256-cfb must be hidden from Xray's node list rather than
+        // reaching a generated config that fails to start. mihomo still
+        // serves it (Clash Meta kept the legacy ciphers), so it must stay
+        // available there.
+        let mut ss_legacy = node(Protocol::Shadowsocks, None, None);
+        ss_legacy.config = ProtocolConfig::Shadowsocks {
+            method: "aes-256-cfb".into(),
+            password: "pw".into(),
+            plugin: None,
+            plugin_opts: None,
+            shadow_tls: None,
+        };
+        assert!(!CoreKind::Xray.supports_node(&ss_legacy));
+        assert!(CoreKind::Mihomo.supports_node(&ss_legacy));
+        assert!(CoreKind::SingBox.supports_node(&ss_legacy));
+        // AEAD and SS2022 methods remain fine under Xray.
+        let mut ss_2022 = node(Protocol::Shadowsocks, None, None);
+        ss_2022.config = ProtocolConfig::Shadowsocks {
+            method: "2022-blake3-aes-256-gcm".into(),
+            password: "pw".into(),
+            plugin: None,
+            plugin_opts: None,
+            shadow_tls: None,
+        };
+        assert!(CoreKind::Xray.supports_node(&ss_2022));
         // sing-box accepts everything.
         assert!(CoreKind::SingBox.supports_node(&ss_stls));
         assert!(CoreKind::SingBox.supports_node(&vision));
