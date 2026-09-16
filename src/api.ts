@@ -520,14 +520,22 @@ export function getLanIp() {
   return invoke<string | null>("get_lan_ip");
 }
 
-export function checkCoreUpdate(kind: CoreKind | null, localVersion?: string | null) {
+export function checkCoreUpdate(
+  kind: CoreKind | null,
+  localVersion?: string | null,
+  includePrerelease?: boolean,
+) {
   return invoke<{
     kind: string;
     latest_version: string;
     update_available: boolean;
     asset_name: string;
     size: number;
-  }>("check_core_update", { kind, localVersion: localVersion ?? null });
+  }>("check_core_update", {
+    kind,
+    localVersion: localVersion ?? null,
+    includePrerelease: includePrerelease ?? false,
+  });
 }
 
 /** Latest app release tag from GitHub; routes via the running proxy.

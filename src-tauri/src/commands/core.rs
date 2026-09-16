@@ -1,6 +1,7 @@
 use crate::core::{
     active_core_version, bundled_core_version, detect_platform, download_latest_core_with_progress,
-    fetch_latest_app_tag, fetch_latest_app_tag_via_redirect, fetch_latest_release_with_proxy,
+    fetch_latest_app_tag, fetch_latest_app_tag_via_redirect,
+    fetch_latest_core_release_including_prerelease, fetch_latest_release_with_proxy,
     inspect_core_bin, CoreDownloadResult, CoreKind, CoreSource,
 };
 use crate::error::AppError;
@@ -72,17 +73,28 @@ pub fn get_core_info(
 }
 
 /// Remote latest version only (network). Call after local info is shown.
+/// `include_prerelease` opts into the REST API releases list (the only way
+/// to see a pre-release tag — the default `releases/latest` redirect path
+/// can never surface one) and must stay an explicit user choice, since
+/// unauthenticated api.github.com is capped at 60 req/h per IP.
 #[tauri::command]
 pub async fn check_core_update(
     state: State<'_, AppState>,
     kind: Option<String>,
     local_version: Option<String>,
+    include_prerelease: Option<bool>,
 ) -> Result<CoreUpdateInfo, String> {
     let kind = parse_kind(kind);
     let proxy_url = current_download_proxy(&state)?;
-    let latest = fetch_latest_release_with_proxy(kind, proxy_url.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
+    let latest = if include_prerelease.unwrap_or(false) {
+        fetch_latest_core_release_including_prerelease(kind, proxy_url.as_deref())
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        fetch_latest_release_with_proxy(kind, proxy_url.as_deref())
+            .await
+            .map_err(|e| e.to_string())?
+    };
     let update_available = match &local_version {
         Some(local) => is_newer_version(&latest.version, local),
         None => true,
@@ -272,6 +284,7 @@ pub async fn download_core(
             total: None,
             percent: None,
             via_proxy: proxy_url.is_some(),
+            version: result.version.clone(),
         },
     );
     let data_dir = state.app_data_dir.clone();

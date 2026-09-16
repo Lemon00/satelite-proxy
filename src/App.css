@@ -1660,6 +1660,16 @@ button {
   gap: 0.25rem;
 }
 
+/* Pre-release opt-in switch, sharing the row with the compact core buttons —
+   sits flush left of them, same tight sizing as .kernel-row-actions .glass-btn. */
+.core-prerelease-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+
 .kernel-card .kernel-row-foot {
   margin-top: auto;
 }

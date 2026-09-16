@@ -32,8 +32,11 @@ void listen<CoreDownloadProgress>("core-download-progress", (event) => {
 
 /** Call when a download/reset starts, before awaiting the backend call.
  * Seeds a "preparing" placeholder so the progress UI shows immediately,
- * before the backend's first real progress event arrives. */
-export function beginCoreDownload(kind: CoreKind, viaProxy = false): void {
+ * before the backend's first real progress event arrives. `version` is the
+ * tag being requested (empty when unknown, e.g. a reset that lets the
+ * backend resolve "latest" itself) — later progress events overwrite it
+ * with the resolved version once the backend picks one. */
+export function beginCoreDownload(kind: CoreKind, viaProxy = false, version = ""): void {
   state = {
     kind,
     progress: {
@@ -43,6 +46,7 @@ export function beginCoreDownload(kind: CoreKind, viaProxy = false): void {
       total: null,
       percent: null,
       via_proxy: viaProxy,
+      version,
     },
     error: null,
   };

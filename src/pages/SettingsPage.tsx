@@ -159,6 +159,16 @@ export function SettingsPage() {
   const [coreCheckingKind, setCoreCheckingKind] = useState<CoreKind | null>(null);
   const [coreProxyAvailable, setCoreProxyAvailable] = useState(false);
   const [sidecarRunning, setSidecarRunning] = useState(false);
+  // Per-kernel "include pre-releases" toggle for the update check. Opt-in
+  // and unpersisted: the REST API path it enables is rate-limited (60 req/h
+  // per IP, unauthenticated), so it must stay a deliberate choice made right
+  // before each manual check, not a sticky setting that silently keeps
+  // spending that budget.
+  const [corePrerelease, setCorePrerelease] = useState<Record<CoreKind, boolean>>({
+    singbox: false,
+    xray: false,
+    mihomo: false,
+  });
   // coreError is shared by every core-related flow on this page (update
   // check, reload, download, restore) and feeds the single ErrorModal below.
   const [coreError, setCoreError] = useState<string | null>(null);
@@ -234,34 +244,37 @@ export function SettingsPage() {
 
   // Manual-only ("检查" button): hits the network on every click. The result
   // is mirrored into the session snapshot so remounts keep showing it.
-  const runCoreUpdateCheck = useCallback(async (kind: CoreKind, localVersion: string | null) => {
-    setCoreCheckingKind(kind);
-    setCoreError(null);
-    try {
-      const update = await checkCoreUpdate(kind, localVersion);
-      coreLatestSnapshots.set(kind, {
-        local_version: localVersion,
-        latest_version: update.latest_version,
-        update_available: update.update_available,
-      });
-      setCores((prev) => {
-        const info = prev[kind];
-        if (!info) return prev;
-        return {
-          ...prev,
-          [kind]: {
-            ...info,
-            latest_version: update.latest_version,
-            update_available: update.update_available,
-          },
-        };
-      });
-    } catch (e) {
-      setCoreError(typeof e === "string" ? e : String(e));
-    } finally {
-      setCoreCheckingKind(null);
-    }
-  }, []);
+  const runCoreUpdateCheck = useCallback(
+    async (kind: CoreKind, localVersion: string | null, includePrerelease: boolean) => {
+      setCoreCheckingKind(kind);
+      setCoreError(null);
+      try {
+        const update = await checkCoreUpdate(kind, localVersion, includePrerelease);
+        coreLatestSnapshots.set(kind, {
+          local_version: localVersion,
+          latest_version: update.latest_version,
+          update_available: update.update_available,
+        });
+        setCores((prev) => {
+          const info = prev[kind];
+          if (!info) return prev;
+          return {
+            ...prev,
+            [kind]: {
+              ...info,
+              latest_version: update.latest_version,
+              update_available: update.update_available,
+            },
+          };
+        });
+      } catch (e) {
+        setCoreError(typeof e === "string" ? e : String(e));
+      } finally {
+        setCoreCheckingKind(null);
+      }
+    },
+    [],
+  );
 
   // Local core status only — no version check here. Latest-release lookups
   // are manual-only (and rate-limited by being click-driven); overlaying the
@@ -640,7 +653,7 @@ export function SettingsPage() {
     const status = await getProxyStatus().catch(() => null);
     const viaProxy = !!status?.running;
     setCoreProxyAvailable(viaProxy);
-    beginCoreDownload(kind, viaProxy);
+    beginCoreDownload(kind, viaProxy, tag ?? "");
     try {
       await downloadCore(kind, tag ?? null);
       await reloadCore();
@@ -655,7 +668,7 @@ export function SettingsPage() {
   }
 
   async function onCheckCoreUpdate(kind: CoreKind) {
-    await runCoreUpdateCheck(kind, cores[kind]?.version ?? null);
+    await runCoreUpdateCheck(kind, cores[kind]?.version ?? null, corePrerelease[kind]);
   }
 
   /** Core card "factory reset": with a bundled copy, drop the user-downloaded
@@ -668,7 +681,7 @@ export function SettingsPage() {
     if (info?.bundled_version) {
       if (!confirm(t("settings.coreRestoreConfirm", { v: info.bundled_version }))) return;
       setCoreError(null);
-      beginCoreDownload(kind);
+      beginCoreDownload(kind, false, info.bundled_version);
       try {
         await resetCoreToBundled(kind);
         await reloadCore();
@@ -794,6 +807,22 @@ export function SettingsPage() {
         </div>
 
         <div className="kernel-row-actions">
+          {/* Hidden for now — an Xray pre-release picked up via this toggle
+             broke connectivity (protocol translation issue suspected).
+             Keeping the toggle/state/backend path in place so it can come
+             back once that's root-caused; just not user-reachable. */}
+          {false && (
+            <span className="core-prerelease-toggle mono muted" title={t("settings.corePrereleaseHint")}>
+              {t("settings.corePrerelease")}
+              <GlassSwitchControl
+                checked={corePrerelease[kind]}
+                title={t("settings.corePrereleaseHint")}
+                disabled={anyBusy || checking}
+                size="sm"
+                onChange={(next) => setCorePrerelease((prev) => ({ ...prev, [kind]: next }))}
+              />
+            </span>
+          )}
           <GlassButton
             icon="↻"
             disabled={anyBusy || checking || !info}
@@ -806,11 +835,15 @@ export function SettingsPage() {
           {/* One stable label in every state — the previous state-dependent
              wording (下载/更新内核/重新下载) flip-flopped with the
              staged/downloaded source and read like random renames. Update
-             availability is already signaled by the pill in the meta row. */}
+             availability is already signaled by the pill in the meta row.
+             Pins to the checked latest_version (once a check has run) so a
+             pre-release picked up via the toggle above is what actually
+             gets installed — otherwise the backend would look up latest
+             itself and silently land back on the non-prerelease tag. */}
           <GlassButton
             icon="⤓"
             disabled={anyBusy || checking}
-            onClick={() => void onDownloadCore(kind)}
+            onClick={() => void onDownloadCore(kind, info?.latest_version ?? null)}
           >
             {busy ? t("settings.coreDownloading") : t("settings.coreDownload")}
           </GlassButton>

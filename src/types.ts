@@ -606,6 +606,7 @@ export interface CoreDownloadProgress {
   total?: number | null;
   percent?: number | null;
   via_proxy: boolean;
+  version: string;
 }
 
 export type CoreState =

@@ -22,7 +22,10 @@ export function CoreDownloadToast() {
         <span className="ver-mark kernel-mark" aria-hidden>
           <CoreMark kind={kind} />
         </span>
-        <span className="core-download-toast-name">{name}</span>
+        <span className="core-download-toast-name">
+          {name}
+          {progress?.version ? <span className="mono muted"> {progress.version}</span> : null}
+        </span>
         {!error && <span className="lat-spinner" aria-hidden />}
       </div>
       {error ? (

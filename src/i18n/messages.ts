@@ -310,6 +310,9 @@ const en = {
   "settings.coreLatestShort": "latest",
   "settings.coreCheck": "Check",
   "settings.coreChecking": "Checking…",
+  "settings.corePrerelease": "Pre-release",
+  "settings.corePrereleaseHint":
+    "Include pre-release tags in the update check (uses GitHub's rate-limited API instead of the default redirect check).",
   "settings.coreDownload": "Install",
   "settings.coreRedownload": "Re-download",
   "settings.coreRestore": "Restore",
@@ -1269,6 +1272,9 @@ const zh: Record<MessageKey, string> = {
   "settings.coreLatestShort": "最新",
   "settings.coreCheck": "检测",
   "settings.coreChecking": "检测中…",
+  "settings.corePrerelease": "预发布版",
+  "settings.corePrereleaseHint":
+    "检测时包含预发布版本（会走 GitHub 有请求次数限制的 API，而非默认的重定向检测）。",
   "settings.coreDownload": "下载",
   "settings.coreRedownload": "重新下载",
   "settings.coreRestore": "重置",

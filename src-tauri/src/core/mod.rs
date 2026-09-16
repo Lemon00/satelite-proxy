@@ -30,8 +30,8 @@ pub use memory::ProcessMemInfo;
 
 pub use download::{
     download_latest_core, download_latest_core_with_progress, fetch_latest_app_tag,
-    fetch_latest_app_tag_via_redirect, fetch_latest_release_with_proxy, CoreDownloadProgress,
-    CoreDownloadResult, LatestReleaseInfo,
+    fetch_latest_app_tag_via_redirect, fetch_latest_core_release_including_prerelease,
+    fetch_latest_release_with_proxy, CoreDownloadProgress, CoreDownloadResult, LatestReleaseInfo,
 };
 #[cfg(test)]
 pub use paths::find_bundled_core;

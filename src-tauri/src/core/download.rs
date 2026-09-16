@@ -37,6 +37,7 @@ pub struct CoreDownloadProgress {
     pub total: Option<u64>,
     pub percent: Option<u8>,
     pub via_proxy: bool,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -87,6 +88,79 @@ pub async fn fetch_latest_release_with_proxy(
             ))
         }
     }
+}
+
+/// Latest release tag *including pre-releases*, via the REST API's releases
+/// list (`GET /repos/{repo}/releases`, first entry — GitHub returns them
+/// newest-first regardless of the `prerelease` flag). The `releases/latest`
+/// redirect used by `fetch_latest_release_with_proxy` can never surface a
+/// pre-release — GitHub defines that endpoint as "latest non-prerelease,
+/// non-draft" — so this is the only way to see e.g. an Xray-core release
+/// candidate. Opt-in only (explicit user toggle): unauthenticated
+/// api.github.com is capped at 60 req/h per IP and 403s easily behind shared
+/// NAT/proxy exits, so a non-success response falls back to the same
+/// `gh-proxy.com` mirror `fetch_asset_with_mirror_fallback` uses — it proxies
+/// api.github.com too, and (observed) sits behind a token-authenticated
+/// 5000 req/h budget instead of the 60 req/h anonymous one.
+pub async fn fetch_latest_core_release_including_prerelease(
+    kind: CoreKind,
+    proxy_url: Option<&str>,
+) -> AppResult<LatestReleaseInfo> {
+    #[derive(Deserialize)]
+    struct ReleaseTag {
+        tag_name: String,
+    }
+    let platform = detect_platform()?;
+    let path = format!("repos/{}/releases?per_page=1", kind.repo());
+    let url = format!("https://api.github.com/{path}");
+
+    let direct_err = match http_client(proxy_url)?
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let releases: Vec<ReleaseTag> = resp
+                .json()
+                .await
+                .map_err(|e| AppError::Core(format!("parse github releases: {e}")))?;
+            let tag = releases
+                .first()
+                .ok_or_else(|| AppError::Core(format!("no releases found for {}", kind.repo())))?;
+            return Ok(release_info_from_tag(kind, &tag.tag_name, platform));
+        }
+        Ok(resp) => format!("github api status {}", resp.status()),
+        Err(e) => format!("github api: {e}"),
+    };
+
+    let mirror_url = format!("{GITHUB_ASSET_MIRROR_PREFIX}{url}");
+    crate::app_log::warn(
+        "core",
+        format!("{}: direct releases api failed ({direct_err}); trying mirror: {mirror_url}", kind.display_name()),
+    );
+    let resp = http_client(None)?
+        .get(&mirror_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|e| AppError::Core(format!("{direct_err}; mirror: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(AppError::Core(format!(
+            "{direct_err}; mirror status {}",
+            resp.status()
+        )));
+    }
+    let releases: Vec<ReleaseTag> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Core(format!("parse github releases (mirror): {e}")))?;
+    let tag = releases
+        .first()
+        .ok_or_else(|| AppError::Core(format!("no releases found for {}", kind.repo())))?;
+    Ok(release_info_from_tag(kind, &tag.tag_name, platform))
 }
 
 /// Latest release tag of a core repo via the `releases/latest` page redirect
@@ -384,6 +458,7 @@ where
     let declared_total = (info.size > 0).then_some(info.size);
     let mut last_percent = None;
     let download_progress = Arc::clone(&progress);
+    let download_version = info.version.clone();
     let bytes = crate::services::http_body::read_limited_with_progress(
         resp,
         MAX_CORE_ARCHIVE_BYTES,
@@ -402,6 +477,7 @@ where
                     total,
                     percent,
                     via_proxy,
+                    version: download_version.clone(),
                 });
             }
         },
@@ -422,6 +498,7 @@ where
         total: Some(downloaded),
         percent: Some(100),
         via_proxy,
+        version: info.version.clone(),
     });
     let result = tokio::task::spawn_blocking(move || {
         install_downloaded_archive(kind, &app_data_dir, &info, bytes)
@@ -435,6 +512,7 @@ where
         total: Some(downloaded),
         percent: Some(100),
         via_proxy,
+        version: result.version.clone(),
     });
     Ok(result)
 }
