@@ -9,6 +9,7 @@ import {
   getSubscription,
   listAllNodes,
   listSubscriptions,
+  onNodeLatencyChanged,
   onProxySnapshot,
   peekProxyStatus,
   previewSingboxConfig,
@@ -469,15 +470,44 @@ function coreDisplayName(kind: string | null | undefined): string {
   // Auto-probe the exit IP once the first status wave lands (page mount),
   // then again whenever the running edge flips (start/stop changes whether
   // the probe goes through the core) or the selected node changes (likely
-  // new exit). Deduped by ref key; overlapping probes are version-stamped
-  // away inside onProbeExitIp.
+  // new exit). Latency re-probes on the same edges but only while running —
+  // a stopped core would answer with a direct TCP ping and clobber the last
+  // real through-proxy reading. Deduped by ref key; overlapping probes are
+  // version-stamped away inside onProbeExitIp.
   const autoProbeKey = `${proxy?.running ?? false}:${currentNodeId ?? ""}`;
   useEffect(() => {
     if (!statusReady) return;
     if (autoProbeKeyRef.current === autoProbeKey) return;
     autoProbeKeyRef.current = autoProbeKey;
     void onProbeExitIp();
+    if (proxy?.running) void onProbeLatency();
   }, [autoProbeKey, statusReady]);
+
+  // Live latency for the current node: every accepted probe write (manual
+  // batch tests, smart-switch patrol/scan) arrives as a push event — the
+  // card mirrors the engine's own readings instead of waiting for the next
+  // edge-triggered probe or a click. Guarded by tested_at so an older
+  // push never rolls back a fresher local reading.
+  useEffect(() => {
+    return onNodeLatencyChanged((change) => {
+      setCurrentNode((n) => {
+        if (!n || n.id !== change.id) return n;
+        if (
+          change.latency_at != null &&
+          n.latency_at != null &&
+          change.latency_at < n.latency_at
+        ) {
+          return n;
+        }
+        return {
+          ...n,
+          latency_ms: change.latency_ms,
+          latency_at: change.latency_at ?? n.latency_at,
+          latency_method: change.method,
+        };
+      });
+    });
+  }, []);
 
   // Core switch transition: the setting flips instantly but the running core
   // only lands on the new binary after the debounced restart. While the two

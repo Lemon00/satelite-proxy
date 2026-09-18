@@ -10,6 +10,7 @@ import {
   listCustomConfigNodes,
   listNodeIds,
   listNodesPage,
+  onNodeLatencyChanged,
   setCurrentNode,
   testCustomNodesLatency,
   testNodesLatency,
@@ -107,6 +108,37 @@ export function SimpleServersPage() {
     typeof createLatencyResultBuffer
   > | null>(null);
   useEffect(() => () => latencyBufferRef.current?.stop(), []);
+
+  // Live latency pushes: probe writes accepted by the store (manual batch
+  // tests elsewhere, smart-switch patrol/scan) arrive as events — visible
+  // rows stay warm without a reload. Guarded by tested_at so an older push
+  // never rolls back a fresher streaming result; custom-mode nodes live
+  // outside the store and never receive events.
+  useEffect(() => {
+    if (runtimeSource.startsWith("singbox:")) return;
+    return onNodeLatencyChanged((change) => {
+      setNodes((prev) => {
+        const idx = prev.findIndex((n) => n.id === change.id);
+        if (idx < 0) return prev;
+        const n = prev[idx];
+        if (
+          change.latency_at != null &&
+          n.latency_at != null &&
+          change.latency_at < n.latency_at
+        ) {
+          return prev;
+        }
+        const next = [...prev];
+        next[idx] = {
+          ...n,
+          latency_ms: change.latency_ms,
+          latency_at: change.latency_at ?? n.latency_at,
+          latency_method: change.method,
+        };
+        return next;
+      });
+    });
+  }, [runtimeSource]);
 
 
   const reload = useCallback(async (append = false) => {

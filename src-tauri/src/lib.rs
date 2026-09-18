@@ -229,6 +229,11 @@ pub fn run() {
                 crate::api::warmup_blocking_client();
             });
 
+            // Register the app handle for store-level event emitters that
+            // have no Tauri parameter (node latency changes from background
+            // probe paths — see state::emit_node_latency_changes).
+            state::set_app_handle(app.handle().clone());
+
             if let Err(e) = tray::setup_tray(app.handle()) {
                 app_log::error("tray", format!("setup failed: {e}"));
             }

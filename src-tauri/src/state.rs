@@ -825,6 +825,49 @@ impl AppState {
         f(&guard)
     }
 
+    /// Persist probe results through the real-vs-ping priority rule and
+    /// return the accepted subset — callers feed it to
+    /// [`emit_node_latency_changes`] so every write path (manual batch
+    /// tests, smart-switch patrol/scan) shares one store→UI channel.
+    pub fn apply_latency_results(
+        &self,
+        results: &[crate::services::latency::LatencyResult],
+    ) -> AppResult<Vec<NodeLatencyChange>> {
+        self.with_store_mut(|store| Ok(Self::accepted_latency_changes(store, results)))
+    }
+
+    /// try-lock variant for the smart-switch engine (§9.24): a busy store
+    /// skips this round's write instead of queueing the worker. `None`
+    /// means the store was locked; callers keep their skip bookkeeping.
+    pub fn try_apply_latency_results(
+        &self,
+        results: &[crate::services::latency::LatencyResult],
+    ) -> Option<Vec<NodeLatencyChange>> {
+        self.try_with_store_mut(|store| Ok(Self::accepted_latency_changes(store, results)))
+            .map(|r| r.unwrap_or_default())
+    }
+
+    fn accepted_latency_changes(
+        store: &mut AppStore,
+        results: &[crate::services::latency::LatencyResult],
+    ) -> Vec<NodeLatencyChange> {
+        results
+            .iter()
+            .filter(|r| !r.id.is_empty())
+            .filter_map(|r| {
+                store
+                    .update_node_latency(&r.id, r.latency_ms, r.tested_at, &r.method)
+                    .then(|| NodeLatencyChange {
+                        id: r.id.clone(),
+                        name: r.name.clone(),
+                        latency_ms: r.latency_ms,
+                        latency_at: Some(r.tested_at),
+                        method: r.method.clone(),
+                    })
+            })
+            .collect()
+    }
+
     pub fn start_proxy(
         &self,
         resource_dir: Option<&Path>,
@@ -1686,6 +1729,44 @@ struct CoreStatusChangedEvent {
     /// Alive sidecar core kinds (e.g. `["xray","mihomo"]`); the frontend
     /// uses it for per-core indicators, `sidecar_running` for "any".
     sidecar_kinds: Vec<String>,
+}
+
+/// Latency results accepted by the store (post priority-rule, see
+/// [`AppStore::update_node_latency`]) are pushed to the UI with this event —
+/// so background probes (smart-switch patrol/scan, manual batch tests)
+/// refresh the dashboard latency card and node rows without a click or a
+/// list reload. Payload: `Vec<NodeLatencyChange>`.
+const NODE_LATENCY_EVENT: &str = "node-latency-changed";
+
+#[derive(Clone, serde::Serialize)]
+pub struct NodeLatencyChange {
+    pub id: String,
+    pub name: String,
+    pub latency_ms: Option<u32>,
+    pub latency_at: Option<i64>,
+    /// `clash_api` (real, through-kernel) | `tcp` (direct ping)
+    pub method: String,
+}
+
+/// App-handle registry for emitters that have no Tauri parameter to receive
+/// one (latency writes happen deep inside smart-switch rounds and store
+/// commands). Set once during setup; unset in unit tests (emit is a no-op).
+static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_app_handle(app: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(app);
+}
+
+/// Announce accepted latency results to the UI. No-op without a handle
+/// (unit tests) or an empty change set.
+pub fn emit_node_latency_changes(changes: &[NodeLatencyChange]) {
+    if changes.is_empty() {
+        return;
+    }
+    if let Some(app) = APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = app.emit(NODE_LATENCY_EVENT, changes.to_vec());
+    }
 }
 
 /// Pure decision core (unit-tested): restart only on the running→not-running

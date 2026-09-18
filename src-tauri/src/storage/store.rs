@@ -78,6 +78,12 @@ pub struct StoredNode {
     pub subscription_id: String,
     #[serde(flatten)]
     pub node: ProxyNode,
+    /// How `node.latency_ms` was last measured: `clash_api` (real,
+    /// through-kernel URL delay) or `tcp` (direct ping). Real readings take
+    /// priority — a ping must never overwrite one (see
+    /// [`AppStore::update_node_latency`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_method: Option<String>,
 }
 
 impl AppStore {
@@ -733,6 +739,7 @@ impl AppStore {
             self.nodes.push(StoredNode {
                 subscription_id: id.clone(),
                 node,
+                latency_method: None,
             });
         }
         self.gc_favorite_nodes();
@@ -1046,15 +1053,31 @@ impl AppStore {
         Ok(node.node.clone())
     }
 
+    /// Record a probe result under the real-vs-ping priority rule:
+    /// `clash_api` (real, through-kernel URL delay) always overwrites;
+    /// `tcp` (direct ping) only lands when the stored value is not a real
+    /// reading — "TCP alive but proxy dead" is exactly the false positive a
+    /// ping must not paint over. Other methods (`unsupported`/`error`) carry
+    /// no measurement and never write. Returns whether the value landed
+    /// (also false for an unknown node id) — callers emit the UI event only
+    /// for landed results.
     pub fn update_node_latency(
         &mut self,
         id: &str,
         latency_ms: Option<u32>,
         latency_at: i64,
+        method: &str,
     ) -> bool {
+        if method != "clash_api" && method != "tcp" {
+            return false;
+        }
         if let Some(n) = self.nodes.iter_mut().find(|n| n.node.id == id) {
+            if method == "tcp" && n.latency_method.as_deref() == Some("clash_api") {
+                return false;
+            }
             n.node.latency_ms = latency_ms;
             n.node.latency_at = Some(latency_at);
+            n.latency_method = Some(method.to_string());
             true
         } else {
             false
@@ -2178,6 +2201,7 @@ mod tests {
                 latency_ms: None,
                 latency_at: None,
             },
+            latency_method: None,
         };
         // Legacy collision: same server/port/protocol, different creds, but
         // manually assigned the same id (simulating stale/corrupt data).
@@ -2230,6 +2254,7 @@ mod tests {
         store.nodes.push(StoredNode {
             subscription_id: "sub".into(),
             node,
+            latency_method: None,
         });
         let set = RuleSet::new_user(
             "批量集",
@@ -2345,6 +2370,7 @@ mod tests {
                 latency_ms: None,
                 latency_at: None,
             },
+            latency_method: None,
         };
         let mut store = AppStore::default();
         store.nodes.push(mk_node("node-1", "东京 01", 8388));
@@ -2473,6 +2499,7 @@ mod tests {
         store.nodes.push(StoredNode {
             subscription_id: "sub".into(),
             node: node_pin,
+            latency_method: None,
         });
         let (updated, _) = store
             .batch_set_rule_targets(
@@ -2776,6 +2803,7 @@ mod tests {
                 latency_ms: None,
                 latency_at: None,
             },
+            latency_method: None,
         }
     }
 
@@ -3706,6 +3734,7 @@ mod tests {
                 latency_ms: None,
                 latency_at: None,
             },
+            latency_method: None,
         }
     }
 
@@ -3731,6 +3760,36 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("已存在同名"));
+    }
+
+    #[test]
+    fn update_node_latency_prioritizes_real_over_ping() {
+        let mut store = AppStore::default();
+        store.nodes.push(mk_stored_node("n1", "HK-1"));
+
+        // Ping lands when nothing (or only a ping) is stored.
+        assert!(store.update_node_latency("n1", Some(40), 100, "tcp"));
+        assert_eq!(store.nodes[0].node.latency_ms, Some(40));
+        assert!(store.update_node_latency("n1", Some(35), 200, "tcp"));
+
+        // Real always overwrites — including a failure (None).
+        assert!(store.update_node_latency("n1", Some(120), 300, "clash_api"));
+        assert_eq!(store.nodes[0].node.latency_ms, Some(120));
+        assert!(store.update_node_latency("n1", None, 400, "clash_api"));
+        assert_eq!(store.nodes[0].node.latency_ms, None);
+        assert_eq!(store.nodes[0].latency_method.as_deref(), Some("clash_api"));
+
+        // A ping must never paint over a real reading — even a failed one
+        // ("TCP alive but proxy dead" is the classic false positive).
+        assert!(!store.update_node_latency("n1", Some(20), 500, "tcp"));
+        assert_eq!(store.nodes[0].node.latency_ms, None);
+        assert_eq!(store.nodes[0].node.latency_at, Some(400));
+
+        // Non-measurement methods carry no value and never write.
+        assert!(!store.update_node_latency("n1", Some(5), 600, "unsupported"));
+        assert!(!store.update_node_latency("n1", Some(5), 600, "error"));
+        // Unknown node id → not applied.
+        assert!(!store.update_node_latency("missing", Some(5), 600, "tcp"));
     }
 
     #[test]
