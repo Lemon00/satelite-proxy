@@ -11,6 +11,7 @@ import {
   listNodeIds,
   listNodesPage,
   onNodeLatencyChanged,
+  onProxySnapshot,
   setCurrentNode,
   testCustomNodesLatency,
   testNodesLatency,
@@ -86,6 +87,9 @@ export function SimpleServersPage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [runtimeSource, setRuntimeSource] = useState("generated");
+  // Xray has no delay API — the speed-test button would silently degrade to
+  // plain TCP pings. Gray it out instead (see NodesPage's real-latency button).
+  const [xrayCore, setXrayCore] = useState(false);
   // Session-only latency results for custom-mode nodes (not persisted backend-side).
   const [customLatency, setCustomLatency] = useState<CustomLatencyMap>(new Map());
   const [sortMode, setSortMode] = useState<SortMode>(() => readSortMode());
@@ -108,6 +112,16 @@ export function SimpleServersPage() {
     typeof createLatencyResultBuffer
   > | null>(null);
   useEffect(() => () => latencyBufferRef.current?.stop(), []);
+
+  // Core switches from the shell don't remount this page — track the live
+  // core type so the speed-test button's disabled state follows.
+  useEffect(
+    () =>
+      onProxySnapshot((status) => {
+        setXrayCore((status.core_type ?? "singbox") === "xray");
+      }),
+    [],
+  );
 
   // Live latency pushes: probe writes accepted by the store (manual batch
   // tests elsewhere, smart-switch patrol/scan) arrive as events — visible
@@ -147,6 +161,7 @@ export function SimpleServersPage() {
       const settings = await getSettings();
       setCurrentId(settings.current_node_id ?? null);
       setRuntimeSource(settings.runtime_source || "generated");
+      setXrayCore((settings.core_type ?? "singbox") === "xray");
       setAutoSelect((settings.auto_select as AutoSelectMode) ?? "off");
       const offset = append ? nodes.length : 0;
       if ((settings.runtime_source || "generated").startsWith("singbox:")) {
@@ -236,6 +251,9 @@ export function SimpleServersPage() {
 
   async function onTestAll() {
     if (testing || nodeTotal === 0) return;
+    // Button is disabled under Xray; also refuse from stale renders instead
+    // of silently degrading to plain TCP pings.
+    if (xrayCore) return;
     // Ids in current display order — the backend launches probes (and
     // streams results back) top to bottom of the list as shown. Custom mode
     // probes the extracted (unsaved) nodes — ids come from the loaded list
@@ -371,9 +389,9 @@ export function SimpleServersPage() {
           <GlassButton
             variant="primary"
             icon="⚡"
-            disabled={testing || nodeTotal === 0}
+            disabled={testing || nodeTotal === 0 || xrayCore}
             onClick={() => void onTestAll()}
-            title={t("nodes.testRealLatency")}
+            title={xrayCore ? t("nodes.realLatencyXrayUnsupported") : t("nodes.testRealLatency")}
           >
             {testing ? t("nodes.testing") : t("nodes.testRealLatency")}
           </GlassButton>
