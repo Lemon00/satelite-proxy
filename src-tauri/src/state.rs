@@ -517,6 +517,20 @@ fn recover_lock<'a, T>(mutex: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
     }
 }
 
+/// True when a core startup failure is the transient "port still bound by a
+/// process that just died" race (killed core's accepted sockets linger in
+/// non-LISTENING states; Go cores never set SO_REUSEADDR on Windows, so the
+/// replacement's bind fails until the OS reclaims them). Such failures clear
+/// on their own within seconds — worth one automatic retry.
+fn startup_error_is_bind_race(err: &crate::error::AppError) -> bool {
+    let message = err.to_string().to_lowercase();
+    // WSAEADDRINUSE as Go surfaces it on Windows / the Unix errno wording /
+    // Xray's inbound-listen failure line.
+    message.contains("only one usage of each socket address")
+        || message.contains("address already in use")
+        || message.contains("failed to listen")
+}
+
 impl AppState {
     pub fn load(app_data_dir: PathBuf, resource_dir: Option<PathBuf>) -> AppResult<Self> {
         let store_path = default_store_path(&app_data_dir);
@@ -1018,7 +1032,22 @@ impl AppState {
         let _persistence = self.lock_store_persistence();
         let mut store = self.lock_store();
         let want_system = store.settings.capture_mode == crate::domain::CaptureMode::System;
-        let mut status = runtime.restart_core(&self.app_data_dir, resource_dir, &mut store)?;
+        let mut status = match runtime.restart_core(&self.app_data_dir, resource_dir, &mut store) {
+            Ok(status) => status,
+            // A just-killed core's lingering sockets can outlive even the
+            // bounded port-release waits and make the replacement's first
+            // bind fail. That residue clears by itself within seconds, so
+            // retry once instead of surfacing a dead core to the user.
+            Err(first) if startup_error_is_bind_race(&first) => {
+                app_log::warn(
+                    "core",
+                    format!("restart hit a port bind race, retrying once: {first}"),
+                );
+                std::thread::sleep(Duration::from_millis(2000));
+                runtime.restart_core(&self.app_data_dir, resource_dir, &mut store)?
+            }
+            Err(e) => return Err(e),
+        };
         if runtime.system_proxy_on != want_system {
             status = runtime.set_system_proxy(&store, want_system)?;
         }
@@ -2024,6 +2053,30 @@ pub fn spawn_core_watchdog(app: tauri::AppHandle) {
 #[cfg(test)]
 mod watchdog_tests {
     use super::*;
+
+    #[test]
+    fn bind_race_detection_matches_only_transient_port_failures() {
+        use crate::error::AppError;
+        // Xray on Windows (WSAEADDRINUSE via Go).
+        assert!(startup_error_is_bind_race(&AppError::Core(
+            "Failed to start: app/proxyman/inbound: failed to listen TCP on 2080 > \
+             listen tcp 127.0.0.1:2080: bind: Only one usage of each socket address \
+             (protocol/network address/port) is normally permitted."
+                .into()
+        )));
+        // Unix errno wording (sing-box/mihomo).
+        assert!(startup_error_is_bind_race(&AppError::Core(
+            "listen tcp 0.0.0.0:7890: bind: address already in use".into()
+        )));
+        // Permanent failures must NOT be retried — a config the core rejects
+        // would fail identically on the second attempt.
+        assert!(!startup_error_is_bind_race(&AppError::Core(
+            "failed to parse config: unknown field".into()
+        )));
+        assert!(!startup_error_is_bind_race(&AppError::Core(
+            "端口 2080 仍被占用（已尝试结束监听进程）".into()
+        )));
+    }
 
     #[test]
     fn restarts_only_on_error_edge() {
