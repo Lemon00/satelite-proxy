@@ -175,6 +175,77 @@ mod kernel_selection_poll_tests {
     }
 
     #[test]
+    fn xray_manual_select_with_running_core_requests_restart() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "satelite-xray-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let state = AppState::load(test_dir.clone(), None).expect("load test state");
+        state
+            .with_store_mut(|store| {
+                store.upsert_subscription(
+                    crate::domain::Subscription {
+                        id: "sub".into(),
+                        name: "sub".into(),
+                        source: crate::domain::SubscriptionSource::Url {
+                            url: "https://example.com/sub".into(),
+                        },
+                        last_update: 1,
+                        node_count: 0,
+                        enabled: true,
+                        format: None,
+                        skipped_count: 0,
+                        via_proxy: false,
+                        auto_update: false,
+                        auto_update_interval_min: 1440,
+                        traffic: None,
+                        user_agent: None,
+                    },
+                    vec![crate::domain::ProxyNode {
+                        id: "node-a".into(),
+                        name: "node-a".into(),
+                        protocol: crate::domain::Protocol::Trojan,
+                        server: "example.com".into(),
+                        port: 443,
+                        tls: None,
+                        transport: None,
+                        udp: None,
+                        config: crate::domain::ProtocolConfig::Trojan {
+                            password: "x".into(),
+                        },
+                        source: None,
+                        latency_ms: None,
+                        latency_at: None,
+                    }],
+                )?;
+                store.settings.core_type = "xray".into();
+                Ok(())
+            })
+            .expect("seed xray mode");
+        // Simulate a live core: the liveness probe reads the session state,
+        // and poll() cannot contradict it without a child process.
+        state
+            .lock_runtime()
+            .core
+            .force_state_for_tests(CoreState::Running);
+
+        // Regression: the liveness probe runs before the transition guard —
+        // inside it, is_core_running() always reports false and the Xray
+        // restart flag was silently dropped.
+        let (_, restart_needed, selected_live) = state
+            .select_current_node_serialized("node-a", true, true)
+            .expect("manual pick under running xray must queue a restart");
+        assert!(!selected_live);
+        assert!(restart_needed);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn status_uses_cache_instead_of_waiting_for_runtime_during_transition() {
         let test_dir = std::env::temp_dir().join(format!(
             "satelite-status-cache-{}-{}",
@@ -1272,13 +1343,19 @@ impl AppState {
     ///
     /// Returns `(settings, restart_needed, switched_live)`. Under Xray there
     /// is no live selection API — the pick is persisted and the caller must
-    /// restart the core (`restart_needed = true`).
+    /// restart the core (`restart_needed = true` while the core runs; a
+    /// stopped core only persists for the next start).
     pub fn select_current_node_serialized(
         &self,
         node_id: &str,
         manual: bool,
         close_if_enabled: bool,
     ) -> AppResult<(crate::domain::AppSettings, bool, bool)> {
+        // Probe liveness BEFORE the transition guard: is_core_running()
+        // deliberately reports false while core_transitioning is set, so the
+        // guard below would mask a running Xray core and restart_needed came
+        // out false — manual Xray picks never restarted the core.
+        let core_running = self.is_core_running();
         let _operation = self.begin_core_transition()?;
         let core_kind = {
             let kind = crate::core::CoreKind::parse(
@@ -1341,7 +1418,7 @@ impl AppState {
             Ok((store.settings.clone(), was_kernel))
         })?;
         let restart_needed =
-            was_kernel || (core_kind == crate::core::CoreKind::Xray && self.is_core_running());
+            was_kernel || (core_kind == crate::core::CoreKind::Xray && core_running);
         Ok((settings, restart_needed, selected_live))
     }
 

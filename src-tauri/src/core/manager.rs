@@ -141,6 +141,15 @@ impl CoreManager {
         matches!(self.state, CoreState::Running)
     }
 
+    /// Test-only: force the session state so AppState-level tests can
+    /// exercise liveness-dependent branches without a real core process.
+    /// `poll()` is a no-op without a child/elevated pid, so the forced
+    /// state survives probes.
+    #[cfg(test)]
+    pub(crate) fn force_state_for_tests(&mut self, state: CoreState) {
+        self.state = state;
+    }
+
     /// Kind of the current/last session — set by `start_with_ports`. Callers
     /// wanting the *actual* running core (e.g. custom sing-box profiles keep
     /// running sing-box even when `settings.core_type` is xray) read this.

@@ -428,10 +428,12 @@ pub async fn set_current_node(app: AppHandle, node_id: String) -> Result<AppSett
         let state = worker_app
             .try_state::<AppState>()
             .ok_or_else(|| "app state unavailable".to_string())?;
-        let (settings, was_kernel, _) = state
+        let (settings, restart_needed, _) = state
             .select_current_node_serialized(&node_id, true, true)
             .map_err(|e| e.to_string())?;
-        if was_kernel {
+        // Kernel mode rebuilds the group; Xray has no live selection API —
+        // both land here as restart_needed while the core is running.
+        if restart_needed {
             crate::rule_apply::request_restart(worker_app.clone(), Vec::new());
         }
         Ok(settings)
