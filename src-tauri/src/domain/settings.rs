@@ -123,6 +123,8 @@ pub enum TrayIconStyle {
     Ghost2,
     /// Face ID smiley; mint smile running, black frown (template) stopped.
     Faceid,
+    /// App-icon saturn tile; gray planet stopped, full color running.
+    Saturn,
 }
 
 impl TrayIconStyle {
@@ -136,6 +138,7 @@ impl TrayIconStyle {
             Self::Danger2 => "danger2",
             Self::Ghost2 => "ghost2",
             Self::Faceid => "faceid",
+            Self::Saturn => "saturn",
         }
     }
 
@@ -149,6 +152,7 @@ impl TrayIconStyle {
             "danger2" => Some(Self::Danger2),
             "ghost2" => Some(Self::Ghost2),
             "faceid" | "face" | "smile" => Some(Self::Faceid),
+            "saturn" | "planet" | "app" => Some(Self::Saturn),
             _ => None,
         }
     }

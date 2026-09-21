@@ -24,10 +24,14 @@ import math
 import shutil
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageOps
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "src-tauri" / "icons"
+
+# App-icon source (saturn tile) reused for the saturn tray set.
+APP_ICON_SOURCE = ROOT / "assets" / "icon" / "ic_launcher-web.png"
+SATURN_OFF_BRIGHTNESS = 0.5  # off-state planet: desaturated AND dimmed
 
 # Tray badge (preview 16): black rounded tile, white mark off, mid mint on.
 TRAY_RUNNING = (46, 190, 132, 255)  # #2EBE84
@@ -305,6 +309,20 @@ def draw_buddy(size: int, glasses_color: tuple[int, int, int, int] | None) -> Im
     return _fit_cutout(cut, size)
 
 
+def draw_saturn_tile(size: int, gray: bool) -> Image.Image:
+    """App-icon saturn tile. `gray` desaturates + dims for the off state —
+    the near-black tile barely shifts, only the planet/ring goes dark gray."""
+    src = Image.open(APP_ICON_SOURCE).convert("RGBA")
+    bbox = src.split()[3].getbbox()
+    if bbox:
+        src = src.crop(bbox)
+    if gray:
+        g = ImageOps.grayscale(src)
+        g = g.point(lambda v: int(v * SATURN_OFF_BRIGHTNESS))
+        src = Image.merge("RGBA", (g, g, g, src.split()[3]))
+    return src.resize((size, size), Image.Resampling.LANCZOS)
+
+
 def backup_tray_legacy() -> None:
     """Copy live tray PNGs once. Never overwrite an existing backup."""
     TRAY_LEGACY.mkdir(parents=True, exist_ok=True)
@@ -328,6 +346,10 @@ def write_tray_icons() -> None:
         "badge": (
             draw_tray_badge(64, TRAY_STOPPED),
             draw_tray_badge(64, TRAY_RUNNING),
+        ),
+        "saturn": (
+            draw_saturn_tile(64, gray=True),
+            draw_saturn_tile(64, gray=False),
         ),
         "mark": (
             (

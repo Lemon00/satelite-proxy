@@ -142,7 +142,7 @@ scripts/memory-profile/                           # WebView2 内存剖析（CDP 
 
 - 这些二进制**不入 git**（`.gitignore` 排除 `resources/bin/**/sing-box*`、`xray*`、`mihomo*`、`*.dat`、`wintun.dll`、`mihomo-geodata/`、`libcronet.*`、`resources/rule-sets/*.srs`），本地缺失属正常；
   唯独 `src-tauri/resources/geodata/mihomo/`（country.mmdb + geosite.dat 快照）**入 git**，不在排除列表内
-- 图标生成（两个脚本，均依赖 Pillow，互不触碰对方产物）：`scripts/generate-app-icons.py` 只做应用图标——重采样源图 `assets/icon/ic_launcher-web.png`（1024px 深色圆角方块 + 土星行星环，圆角已内建在源图 alpha 里；内容占画布 ~86% 居中——换新源图时先裁掉 alpha<4 的不可见辉光噪声、内容归方后按此比例居中；该目录其余文件为 Interstellar 安卓素材、.gitignore 排除）出 icon.png/.ico/.icns/Square* 全套。**icns 走满幅变体 `make_mac_icon`**（方块放大到 96% + 垫不透明深底 + 自身 15% 圆角）：macOS 26 Tahoe 会把所有图标套进系统 squircle 并给透明边距垫浅色底板（2026-09 实战：86% 内容 + 透明边距在 Dock 上显示一圈白底），15% 自身圆角比系统 ~22% 遮罩更方，保证系统裁切永远落在不透明像素上；旧版 macOS 则直接显示 15% 圆角深色瓦片。Windows/Linux 产物（ico/Square*/png）保持 86% 圆角透明边距设计（这些平台原生渲染透明度）。icns 为纯 Python 写入、无需 macOS iconutil，Windows 上也能全量再生成；`scripts/generate-tray-icons.py` 只做 8 种托盘图标。**坑：托盘脚本会覆盖 4 个带手工后处理的图标**（`tray/buddy-off|buddy-on|ghost-on|mark-on.png`，ed99be6 的辉光/补白修复只提交了 PNG、未回写脚本），跑完务必 `git checkout HEAD -- src-tauri/icons/tray/{buddy-off,buddy-on,ghost-on,mark-on}.png` 恢复
+- 图标生成（两个脚本，均依赖 Pillow，互不触碰对方产物）：`scripts/generate-app-icons.py` 只做应用图标——重采样源图 `assets/icon/ic_launcher-web.png`（1024px 深色圆角方块 + 土星行星环，圆角已内建在源图 alpha 里；内容占画布 ~86% 居中——换新源图时先裁掉 alpha<4 的不可见辉光噪声、内容归方后按此比例居中；该目录其余文件为 Interstellar 安卓素材、.gitignore 排除）出 icon.png/.ico/.icns/Square* 全套。**icns 走满幅变体 `make_mac_icon`**（方块放大到 96% + 垫不透明深底 + 自身 15% 圆角）：macOS 26 Tahoe 会把所有图标套进系统 squircle 并给透明边距垫浅色底板（2026-09 实战：86% 内容 + 透明边距在 Dock 上显示一圈白底），15% 自身圆角比系统 ~22% 遮罩更方，保证系统裁切永远落在不透明像素上；旧版 macOS 则直接显示 15% 圆角深色瓦片。Windows/Linux 产物（ico/Square*/png）保持 86% 圆角透明边距设计（这些平台原生渲染透明度）。icns 为纯 Python 写入、无需 macOS iconutil，Windows 上也能全量再生成；`scripts/generate-tray-icons.py` 只做托盘图标（badge/saturn/mark/ghost/buddy 脚本生成；danger*/ghost2/faceid 为手工产物不在脚本内；saturn 组=应用图标土星瓦片，off 去色/on 原色）。**坑：托盘脚本会覆盖 4 个带手工后处理的图标**（`tray/buddy-off|buddy-on|ghost-on|mark-on.png`，ed99be6 的辉光/补白修复只提交了 PNG、未回写脚本），跑完务必 `git checkout HEAD -- src-tauri/icons/tray/{buddy-off,buddy-on,ghost-on,mark-on}.png` 恢复
 
 ## 2. 项目是什么
 
@@ -292,7 +292,7 @@ React UI ──invoke()──▶ commands/* ──▶ AppState ──▶ storage
 ### 5.7 系统集成
 
 - `proxy/windows.rs|macos.rs|stub.rs` — 系统代理设置（注册表 / networksetup），含 owned-proxy 标记与崩溃残留清理（启动时 `cleanup_stale_system_proxy`）。
-- `tray.rs` — 托盘菜单 + 图标状态刷新（8 种托盘图标，`src-tauri/icons/tray/`）。
+- `tray.rs` — 托盘菜单 + 图标状态刷新（9 种托盘图标 `TrayIconStyle`，`src-tauri/icons/tray/`；saturn=应用图标同款土星瓦片，off 灰/on 彩色）。
 - `window_ctrl.rs` — 窗口 show/hide/destroy（托盘内存管理）、ui_mode 偏好持久化；尺寸常量与前端 `windowLayout.ts` 对应。
 - `url_scheme.rs` — 注册并抢占 `clash://` `sing-box://` `singbox://` 为默认（深链一键导入）。
 - `autostart.rs` — 开机启动（macOS LaunchAgent）。
