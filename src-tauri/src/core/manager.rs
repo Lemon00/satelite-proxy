@@ -141,6 +141,15 @@ impl CoreManager {
         matches!(self.state, CoreState::Running)
     }
 
+    /// Test-only: force the session state so AppState-level tests can
+    /// exercise liveness-dependent branches without a real core process.
+    /// `poll()` is a no-op without a child/elevated pid, so the forced
+    /// state survives probes.
+    #[cfg(test)]
+    pub(crate) fn force_state_for_tests(&mut self, state: CoreState) {
+        self.state = state;
+    }
+
     /// Kind of the current/last session — set by `start_with_ports`. Callers
     /// wanting the *actual* running core (e.g. custom sing-box profiles keep
     /// running sing-box even when `settings.core_type` is xray) read this.
@@ -309,10 +318,24 @@ impl CoreManager {
         }
         let mut killed = kill_listeners_on_port(port);
 
-        // No server socket → do not busy-wait (CLOSE_WAIT / TIME_WAIT / bind flake).
+        // No server socket → the bind failure is teardown residue of a
+        // process that just died (accepted sockets linger in states netstat
+        // doesn't list as LISTENING yet still block a fresh bind — Go cores
+        // never set SO_REUSEADDR on Windows). Wait a bounded moment for the
+        // OS to reclaim them instead of walking the new core into the same
+        // wall; if it still can't clear, fall through to the loop below and
+        // let the start surface the real error.
         if !port_has_listener(port) {
-            std::thread::sleep(Duration::from_millis(40));
-            if Self::is_port_free(port) || !port_has_listener(port) {
+            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+            while !Self::is_port_free(port) && std::time::Instant::now() < deadline {
+                if port_has_listener(port) {
+                    // A real listener appeared mid-wait — skip to the kill
+                    // path below instead of idling out the deadline.
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if Self::is_port_free(port) {
                 return Ok(());
             }
         }
@@ -779,15 +802,25 @@ impl CoreManager {
     /// stuck/leaked port never hangs a restart; the next start's own
     /// `ensure_ports_free` sweep is the final backstop either way.
     ///
+    /// The wait condition is true bindability (`is_port_free`), not merely
+    /// the netstat LISTEN row: a killed process's accepted sockets linger in
+    /// non-LISTENING states that netstat doesn't attribute to anyone, yet
+    /// they still block a fresh bind (Go cores never set SO_REUSEADDR on
+    /// Windows). A visible foreign listener breaks the wait early —
+    /// `ensure_ports_free` is the one allowed to kill it.
+    ///
     /// Callers opt in explicitly (rather than this running inside `stop()`
-    /// itself) because it spawns `lsof`/`netstat` to probe each port, which
-    /// `force_shutdown` must never do during app-exit shutdown (see there).
+    /// itself) because it probes each port, which `force_shutdown` must
+    /// never do during app-exit shutdown (see there).
     pub fn await_owned_ports_released(&mut self) {
         let ports = std::mem::take(&mut self.owned_ports);
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + Duration::from_millis(2500);
         for port in ports {
-            while Self::has_port_listener(port) && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
+            while !Self::is_port_free(port) && std::time::Instant::now() < deadline {
+                if Self::has_port_listener(port) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
         }
     }

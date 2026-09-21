@@ -1,4 +1,5 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   AppSettings,
   ChainDiagnosis,
@@ -11,6 +12,7 @@ import type {
   LatencyBatchResult,
   LatencyResult,
   ConnectionView,
+  NodeLatencyChange,
   NodePool,
   PoolMode,
   ProxyChain,
@@ -256,6 +258,40 @@ export function onProxySnapshot(listener: ProxySnapshotListener): () => void {
   proxySnapshotListeners.add(listener);
   return () => {
     proxySnapshotListeners.delete(listener);
+  };
+}
+
+/**
+ * Push channel for accepted latency writes (backend
+ * `node-latency-changed`). Every probe path — manual batch tests and the
+ * smart-switch engine's patrol/scan — persists through one store helper that
+ * enforces the real-vs-ping priority rule, then announces the accepted
+ * subset here; mounted pages keep their latency readouts warm without a
+ * click or a list reload. The Tauri listener is attached lazily on the
+ * first subscriber and lives for the app's lifetime.
+ */
+type NodeLatencyListener = (change: NodeLatencyChange) => void;
+const nodeLatencyListeners = new Set<NodeLatencyListener>();
+let nodeLatencyListening = false;
+
+function ensureNodeLatencyListener() {
+  if (nodeLatencyListening) return;
+  nodeLatencyListening = true;
+  void listen<NodeLatencyChange[]>("node-latency-changed", (event) => {
+    for (const change of event.payload ?? []) {
+      for (const listener of nodeLatencyListeners) listener(change);
+    }
+  });
+}
+
+/** Subscribe to node latency updates; returns an unsubscribe fn. */
+export function onNodeLatencyChanged(
+  listener: NodeLatencyListener,
+): () => void {
+  ensureNodeLatencyListener();
+  nodeLatencyListeners.add(listener);
+  return () => {
+    nodeLatencyListeners.delete(listener);
   };
 }
 

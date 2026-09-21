@@ -338,6 +338,9 @@ export interface ProxyNode {
   source?: string;
   latency_ms?: number | null;
   latency_at?: number | null;
+  /** How latency_ms was measured: `clash_api` (real, through-kernel) or
+   * `tcp` (direct ping). Real readings take priority over pings store-side. */
+  latency_method?: string | null;
   /** Present from list_all_nodes — owning subscription. */
   subscription_id?: string;
   subscription_name?: string;
@@ -368,6 +371,18 @@ export interface LatencyResult {
   tested_at: number;
   /** `tcp` | `clash_api` | `unsupported` (needs core running) */
   method?: string;
+}
+
+/** One accepted latency write pushed by the backend (`node-latency-changed`
+ * event) — already filtered by the real-vs-ping priority rule, so consumers
+ * can apply it as-is. */
+export interface NodeLatencyChange {
+  id: string;
+  name: string;
+  latency_ms: number | null;
+  latency_at: number | null;
+  /** `clash_api` (real, through-kernel) | `tcp` (direct ping) */
+  method: string;
 }
 
 export interface LatencyBatchResult {

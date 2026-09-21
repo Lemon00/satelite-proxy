@@ -27,6 +27,9 @@ pub struct GenerateConfigResult {
 pub struct ListedNode {
     #[serde(flatten)]
     pub node: ProxyNode,
+    /// How `node.latency_ms` was measured (`clash_api` real / `tcp` ping) —
+    /// sibling of the flattened node so the wire shape stays flat.
+    pub latency_method: Option<String>,
     pub subscription_id: String,
     pub subscription_name: String,
     /// Not part of `ProxyNode` — favorites are keyed on node id in a
@@ -425,10 +428,12 @@ pub async fn set_current_node(app: AppHandle, node_id: String) -> Result<AppSett
         let state = worker_app
             .try_state::<AppState>()
             .ok_or_else(|| "app state unavailable".to_string())?;
-        let (settings, was_kernel, _) = state
+        let (settings, restart_needed, _) = state
             .select_current_node_serialized(&node_id, true, true)
             .map_err(|e| e.to_string())?;
-        if was_kernel {
+        // Kernel mode rebuilds the group; Xray has no live selection API —
+        // both land here as restart_needed while the core is running.
+        if restart_needed {
             crate::rule_apply::request_restart(worker_app.clone(), Vec::new());
         }
         Ok(settings)
@@ -482,6 +487,7 @@ pub fn list_all_nodes(state: State<'_, AppState>) -> Result<Vec<ListedNode>, Str
                 .filter(|n| core_kind.supports_node(&n.node))
                 .map(|n| ListedNode {
                     node: n.node.clone(),
+                    latency_method: n.latency_method.clone(),
                     subscription_id: n.subscription_id.clone(),
                     subscription_name: names
                         .get(n.subscription_id.as_str())
@@ -555,6 +561,7 @@ pub fn list_nodes_page(
                 })
                 .map(|n| ListedNode {
                     node: n.node.clone(),
+                    latency_method: n.latency_method.clone(),
                     subscription_id: n.subscription_id.clone(),
                     subscription_name: names
                         .get(n.subscription_id.as_str())
@@ -619,6 +626,7 @@ pub fn list_node_ids(
                 })
                 .map(|n| ListedNode {
                     node: n.node.clone(),
+                    latency_method: n.latency_method.clone(),
                     subscription_id: n.subscription_id.clone(),
                     subscription_name: names
                         .get(n.subscription_id.as_str())
@@ -648,6 +656,9 @@ fn extract_custom_nodes(
             .into_iter()
             .map(|node| ListedNode {
                 node,
+                // Session-only nodes parsed from a raw config body — never
+                // probed through the store, so no measurement method exists.
+                latency_method: None,
                 subscription_id: sub_id.to_string(),
                 subscription_name: sub_name.to_string(),
                 // Custom-config nodes are parsed on demand from a raw config

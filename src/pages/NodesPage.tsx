@@ -6,6 +6,8 @@ import {
   listAllNodes,
   listCustomConfigNodes,
   listNodeIds,
+  onNodeLatencyChanged,
+  onProxySnapshot,
   pingNodesLatency,
   setCurrentNode,
   testCustomNodesLatency,
@@ -150,6 +152,9 @@ export function NodesPage() {
   const [detailNode, setDetailNode] = useState<ProxyNode | null>(null);
 
   const [customRuntime, setCustomRuntime] = useState(false);
+  // Xray has no Clash-style delay API — the "real latency" button would
+  // silently degrade to a plain TCP ping. Gray it out instead (ping stays).
+  const [xrayCore, setXrayCore] = useState(false);
   // Session-only latency results for custom-mode nodes (not persisted backend-side).
   const [customLatency, setCustomLatency] = useState<CustomLatencyMap>(new Map());
   const [testing, setTesting] = useState(false);
@@ -174,6 +179,49 @@ export function NodesPage() {
     () => () => latencyBufferRef.current?.stop(),
     [],
   );
+
+  // Core switches from the toolbar ⋯ menu don't remount this page — track
+  // the live core type so the real-latency button's disabled state follows.
+  useEffect(
+    () =>
+      onProxySnapshot((status) => {
+        setXrayCore((status.core_type ?? "singbox") === "xray");
+      }),
+    [],
+  );
+
+  // Live latency pushes: probe writes accepted by the store (manual batch
+  // tests elsewhere, smart-switch patrol/scan) arrive as events — rows stay
+  // warm without a reload. Guarded by tested_at so an older push never
+  // rolls back a fresher streaming result; custom-mode nodes live outside
+  // the store and never receive events.
+  useEffect(() => {
+    if (customRuntime) return;
+    return onNodeLatencyChanged((change) => {
+      setNodes((prev) => {
+        const idx = prev.findIndex((n) => n.id === change.id);
+        if (idx < 0) return prev;
+        const n = prev[idx];
+        if (
+          change.latency_at != null &&
+          n.latency_at != null &&
+          change.latency_at < n.latency_at
+        ) {
+          return prev;
+        }
+        const next = [...prev];
+        next[idx] = {
+          ...n,
+          latency_ms: change.latency_ms,
+          latency_at: change.latency_at ?? n.latency_at,
+          latency_method: change.method,
+        };
+        // Same live re-sort as the streaming path so latency-sort mode
+        // follows the fresh numbers immediately.
+        return sortMode === "latency" ? sortNodes(next, sortMode) : next;
+      });
+    });
+  }, [customRuntime, sortMode]);
 
   // Grouping: default (flat) / subscription / protocol / country, persisted
   // like viewMode. v2 key: the first iteration persisted "sub" as its
@@ -202,6 +250,7 @@ export function NodesPage() {
       const settings = await getSettings();
       const custom = (settings.runtime_source ?? "generated").startsWith("singbox:");
       setCustomRuntime(custom);
+      setXrayCore((settings.core_type ?? "singbox") === "xray");
       setCurrentId(settings.current_node_id ?? null);
       setAutoSelect((settings.auto_select as AutoSelectMode) ?? "off");
       setDelegatedCores(
@@ -471,6 +520,10 @@ export function NodesPage() {
 
   async function onTest(kind: "real" | "ping") {
     if (testing || displayed.length === 0) return;
+    // Grayed-out guard: the button is disabled under Xray, but the function
+    // is also reachable from stale renders — refuse instead of degrading to
+    // a silent TCP ping.
+    if (kind === "real" && xrayCore) return;
     setTesting(true);
     setTestKind(kind);
     setError(null);
@@ -569,6 +622,7 @@ export function NodesPage() {
   // persists the result, same as the batch run.
   async function onTestOne(id: string) {
     if (testing || testingIds.size > 0 || busyId || switching) return;
+    if (xrayCore) return;
     setTestKind("real");
     setError(null);
     setTestingIds(new Set([id]));
@@ -688,7 +742,8 @@ export function NodesPage() {
               type="button"
               role="menuitem"
               className="sub-menu-item"
-              disabled={busy}
+              disabled={busy || xrayCore}
+              title={xrayCore ? t("nodes.realLatencyXrayUnsupported") : undefined}
               onClick={() => {
                 setMenuId(null);
                 void onTestOne(n.id);
@@ -997,9 +1052,9 @@ export function NodesPage() {
               follow the button color instead of rendering as color emoji. */}
           <GlassButton
             icon="◉"
-            disabled={testing || displayed.length === 0}
+            disabled={testing || displayed.length === 0 || xrayCore}
             onClick={() => void onTest("real")}
-            title={t("nodes.testRealLatencyHint")}
+            title={xrayCore ? t("nodes.realLatencyXrayUnsupported") : t("nodes.testRealLatencyHint")}
           >
             {testing && testKind === "real" ? t("nodes.testing") : t("nodes.testRealLatency")}
           </GlassButton>

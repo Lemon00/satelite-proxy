@@ -93,17 +93,11 @@ pub async fn test_nodes_latency(
     .await
     .map_err(|e| e.to_string())?;
 
-    state
-        .with_store_mut(|store| {
-            for r in &results {
-                if r.id.is_empty() {
-                    continue;
-                }
-                store.update_node_latency(&r.id, r.latency_ms, r.tested_at);
-            }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())?;
+    // Persist through the priority rule and announce to other views
+    // (dashboard card, node rows) that share the same numbers.
+    if let Ok(changes) = state.apply_latency_results(&results) {
+        crate::state::emit_node_latency_changes(&changes);
+    }
 
     let ok = results.iter().filter(|r| r.latency_ms.is_some()).count();
     let failed = results.len() - ok;
@@ -152,17 +146,11 @@ pub async fn ping_nodes_latency(
     .await
     .map_err(|e| e.to_string())?;
 
-    state
-        .with_store_mut(|store| {
-            for r in &results {
-                if r.id.is_empty() {
-                    continue;
-                }
-                store.update_node_latency(&r.id, r.latency_ms, r.tested_at);
-            }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())?;
+    // Same shared persist+announce path — a ping only lands where it doesn't
+    // paint over a real reading (priority rule in update_node_latency).
+    if let Ok(changes) = state.apply_latency_results(&results) {
+        crate::state::emit_node_latency_changes(&changes);
+    }
 
     let ok = results.iter().filter(|r| r.latency_ms.is_some()).count();
     let failed = results.len() - ok;
