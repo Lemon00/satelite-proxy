@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
-"""Generate Satelite icons: app icon from assets/icon/ + satellite mark (tray).
+"""Generate the Satelite tray icon sets.
 
   pip install pillow
-  python3 scripts/generate-icons.py           # app + tray
-  python3 scripts/generate-icons.py --tray     # tray only
+  python3 scripts/generate-tray-icons.py
 
-The app icon (icon.png / .ico / .icns / Square*Logo) is resampled from
-assets/icon/ic_launcher-web.png (512px smiley tile, Android web icon).
-The .icns writer is pure Python (PNG payloads), so no iconutil / macOS needed.
+CAUTION: regenerating overwrites four PNGs that carry hand-applied
+post-processing (tray/buddy-off.png, buddy-on.png, ghost-on.png,
+mark-on.png — glow / white-fill fixes from commit ed99be6, never
+back-ported into this script). After running, restore them:
 
-Previous flat marks are kept in src-tauri/icons/tray-legacy/ (copy once, never overwritten).
+  git checkout HEAD -- \
+    src-tauri/icons/tray/buddy-off.png \
+    src-tauri/icons/tray/buddy-on.png \
+    src-tauri/icons/tray/ghost-on.png \
+    src-tauri/icons/tray/mark-on.png
+
+Previous flat marks are kept in src-tauri/icons/tray-legacy/ (copy once,
+never overwritten). App icons live in generate-app-icons.py.
 """
 from __future__ import annotations
 
-import argparse
 import math
 import shutil
-import struct
-from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "src-tauri" / "icons"
-APP_ICON_SOURCE = ROOT / "assets" / "icon" / "ic_launcher-web.png"
 
 # Tray badge (preview 16): black rounded tile, white mark off, mid mint on.
 TRAY_RUNNING = (46, 190, 132, 255)  # #2EBE84
@@ -42,26 +45,6 @@ TRAY_PNGS = (
     "tray-icon-template-32.png",
     "tray-icon-template-22.png",
 )
-
-
-_APP_ICON_SRC: Image.Image | None = None
-
-
-def app_icon_source() -> Image.Image:
-    global _APP_ICON_SRC
-    if _APP_ICON_SRC is None:
-        _APP_ICON_SRC = Image.open(APP_ICON_SOURCE).convert("RGBA")
-    return _APP_ICON_SRC
-
-
-def make_app_icon(size: int) -> Image.Image:
-    """Resample the smiley tile to `size`. Halving steps keep small sizes crisp."""
-    im = app_icon_source()
-    while im.size[0] // 2 >= size:
-        im = im.resize((im.size[0] // 2,) * 2, Image.Resampling.LANCZOS)
-    if im.size != (size, size):
-        im = im.resize((size, size), Image.Resampling.LANCZOS)
-    return im
 
 
 def _rot45(x: float, y: float, cx: float, cy: float) -> tuple[float, float]:
@@ -154,10 +137,6 @@ def draw_satellite_mark(
     d.ellipse([sx - sat_r, sy - sat_r, sx + sat_r, sy + sat_r], fill=color)
 
     return img.resize((size, size), Image.Resampling.LANCZOS)
-
-
-def make_tray(size: int, color: tuple[int, int, int, int]) -> Image.Image:
-    return draw_satellite_mark(size, color)
 
 
 def draw_tray_badge(
@@ -335,47 +314,6 @@ def backup_tray_legacy() -> None:
             shutil.copy2(src, dst)
 
 
-def write_ico(path: Path) -> None:
-    sizes = [16, 24, 32, 48, 64, 128, 256]
-    entries, blobs = [], []
-    for s in sizes:
-        buf = BytesIO()
-        make_app_icon(s).save(buf, format="PNG")
-        data = buf.getvalue()
-        entries.append((s, len(data)))
-        blobs.append(data)
-    offset = 6 + 16 * len(sizes)
-    header = struct.pack("<HHH", 0, 1, len(sizes))
-    dire = body = b""
-    for (s, sz), data in zip(entries, blobs):
-        w = h = 0 if s >= 256 else s
-        dire += struct.pack("<BBBBHHII", w, h, 0, 0, 1, 32, sz, offset)
-        body += data
-        offset += sz
-    path.write_bytes(header + dire + body)
-
-
-def write_icns() -> None:
-    """Pure-Python .icns: PNG payloads for the modern retin@2x types."""
-    types = [
-        ("ic11", 32),   # 16x16@2x
-        ("ic12", 64),   # 32x32@2x
-        ("ic07", 128),  # 128x128
-        ("ic13", 256),  # 128x128@2x
-        ("ic08", 256),  # 256x256
-        ("ic14", 512),  # 256x256@2x
-        ("ic09", 512),  # 512x512
-        ("ic10", 1024), # 512x512@2x
-    ]
-    body = b""
-    for typ, s in types:
-        buf = BytesIO()
-        make_app_icon(s).save(buf, format="PNG")
-        blob = buf.getvalue()
-        body += typ.encode("ascii") + struct.pack(">I", len(blob) + 8) + blob
-    (OUT / "icon.icns").write_bytes(b"icns" + struct.pack(">I", len(body) + 8) + body)
-
-
 def _save_png(img: Image.Image, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     img.save(path, format="PNG")
@@ -430,39 +368,12 @@ def write_tray_icons() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--tray", action="store_true", help="regenerate tray icons only"
-    )
-    args = parser.parse_args()
-
-    OUT.mkdir(parents=True, exist_ok=True)
     write_tray_icons()
-    if args.tray:
-        print(f"Tray icons written → {OUT}")
-        return
-
-    make_app_icon(1024).save(OUT / "icon.png", format="PNG")
-    for name, sz in [
-        ("32x32.png", 32),
-        ("128x128.png", 128),
-        ("128x128@2x.png", 256),
-        ("Square30x30Logo.png", 30),
-        ("Square44x44Logo.png", 44),
-        ("Square71x71Logo.png", 71),
-        ("Square89x89Logo.png", 89),
-        ("Square107x107Logo.png", 107),
-        ("Square142x142Logo.png", 142),
-        ("Square150x150Logo.png", 150),
-        ("Square284x284Logo.png", 284),
-        ("Square310x310Logo.png", 310),
-        ("StoreLogo.png", 50),
-    ]:
-        make_app_icon(sz).save(OUT / name, format="PNG")
-
-    write_ico(OUT / "icon.ico")
-    write_icns()
-    print(f"App + tray icons written → {OUT}")
+    print(f"Tray icons written → {OUT}")
+    print(
+        "NOTE: buddy-off/buddy-on/ghost-on/mark-on carry hand fixes — "
+        "restore them via git if this script overwrote committed versions."
+    )
 
 
 if __name__ == "__main__":
